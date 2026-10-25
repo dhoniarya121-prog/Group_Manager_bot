@@ -1,0 +1,1551 @@
+"""
+All-in-one Telegram Group Manager Bot (Pyrogram + SQLite)
+Created by @roaroic0
+Version 1.0
+
+Features
+  1. Moderation  : /warn /unwarn /warns /mute /unmute /ban /unban /kick
+  2. Welcome     : welcome/goodbye msgs, button or math-CAPTCHA verification,
+                   force subscribe, service message cleaning
+  3. Admin tools : /purge /id /info /settings (inline panel)
+  4. Management  : /stats, auto-delete, /setrules, custom commands, admin-only controls
+"""
+import asyncio
+import html
+import os
+import random
+import re
+import sqlite3
+import time
+from datetime import datetime, timedelta
+from functools import wraps
+
+from dotenv import load_dotenv
+from pyrogram import Client, enums, filters
+from pyrogram.errors import RPCError
+from pyrogram.types import ChatPermissions
+from pyrogram.types import InlineKeyboardButton as Btn
+from pyrogram.types import InlineKeyboardMarkup as Kb
+
+__version__ = "1.0"
+
+load_dotenv()
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+
+app = Client(
+    "group_manager",
+    api_id=API_ID,
+    api_hash=API_HASH,
+    bot_token=BOT_TOKEN,
+    parse_mode=enums.ParseMode.HTML,
+)
+
+# --------------------------------------------------------------------------- #
+# Database
+# --------------------------------------------------------------------------- #
+db = sqlite3.connect("group_manager.db", check_same_thread=False)
+db.executescript(
+    """
+CREATE TABLE IF NOT EXISTS settings (chat_id INTEGER, key TEXT, value TEXT, PRIMARY KEY (chat_id, key));
+CREATE TABLE IF NOT EXISTS warns (chat_id INTEGER, user_id INTEGER, count INTEGER DEFAULT 0, PRIMARY KEY (chat_id, user_id));
+CREATE TABLE IF NOT EXISTS cmds (chat_id INTEGER, name TEXT, reply TEXT, PRIMARY KEY (chat_id, name));
+CREATE TABLE IF NOT EXISTS stats (chat_id INTEGER, day TEXT, joins INTEGER DEFAULT 0, leaves INTEGER DEFAULT 0, messages INTEGER DEFAULT 0, PRIMARY KEY (chat_id, day));
+CREATE TABLE IF NOT EXISTS users (chat_id INTEGER, user_id INTEGER, name TEXT, messages INTEGER DEFAULT 0, PRIMARY KEY (chat_id, user_id));
+"""
+)
+db.commit()
+
+DEFAULTS = {
+    "welcome_on": "1",
+    "welcome_text": "👋 Welcome {mention} to <b>{chat}</b>!\nTotal members: {count}",
+    "goodbye_on": "0",
+    "goodbye_text": "😢 {first} ne group chhod diya.",
+    "verify": "off",  # off | button | captcha
+    "verify_timeout": "120",
+    "forcesub": "",
+    "forcesub_link": "",
+    "rules": "",
+    "autodelete": "0",  # seconds, 0 = off
+    "clean_service": "0",
+    "warn_limit": "3",
+    "warn_action": "mute",  # mute | kick | ban
+    "antilink": "0",
+    "antibot": "0",
+    "flood_limit": "0",  # msgs per 10s, 0 = off
+    "raid_limit": "0",  # joins per 30s, 0 = off
+    "locks": "",
+    "logchan": "",
+}
+
+
+def cfg(chat_id, key):
+    row = db.execute(
+        "SELECT value FROM settings WHERE chat_id=? AND key=?", (chat_id, key)
+    ).fetchone()
+    return row[0] if row else DEFAULTS[key]
+
+
+def setcfg(chat_id, key, value):
+    db.execute(
+        "INSERT OR REPLACE INTO settings VALUES (?,?,?)", (chat_id, key, str(value))
+    )
+    db.commit()
+
+
+def get_warns(chat_id, user_id):
+    row = db.execute(
+        "SELECT count FROM warns WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+    ).fetchone()
+    return row[0] if row else 0
+
+
+def set_warns(chat_id, user_id, n):
+    n = max(0, n)
+    db.execute("INSERT OR REPLACE INTO warns VALUES (?,?,?)", (chat_id, user_id, n))
+    db.commit()
+    return n
+
+
+def bump(chat_id, col):
+    day = time.strftime("%Y-%m-%d")
+    db.execute("INSERT OR IGNORE INTO stats(chat_id, day) VALUES (?,?)", (chat_id, day))
+    db.execute(f"UPDATE stats SET {col}={col}+1 WHERE chat_id=? AND day=?", (chat_id, day))
+    db.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Helpers
+# --------------------------------------------------------------------------- #
+ADMIN = (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
+RESERVED = {
+    "start", "help", "ban", "unban", "kick", "mute", "unmute", "warn", "unwarn",
+    "warns", "purge", "id", "info", "settings", "stats", "rules", "setrules",
+    "setwelcome", "setgoodbye", "verify", "forcesub", "autodelete", "warnlimit",
+    "warnaction", "addcmd", "delcmd", "cmds",
+    "approve", "unapprove", "approved", "lock", "unlock", "locks", "antilink",
+    "antibot", "setflood", "antiraid", "addblacklist", "rmblacklist", "blacklist",
+    "setlog", "report", "admins", "slowmode", "pin", "unpin", "unpinall",
+    "promote", "demote",
+}
+
+_tasks = set()
+_me_id = None
+pending = {}  # (chat_id, user_id) -> {"ans": str, "msg": int}
+admin_cache = {}  # chat_id -> (timestamp, set(ids))
+joined_cache = {}  # (channel, user_id) -> timestamp
+
+
+async def my_id(client):
+    global _me_id
+    if _me_id is None:
+        _me_id = (await client.get_me()).id
+    return _me_id
+
+
+def mention(u):
+    return f'<a href="tg://user?id={u.id}">{html.escape(u.first_name or "User")}</a>'
+
+
+def err(e):
+    return html.escape(str(e))
+
+
+async def _delete_later(msg, secs):
+    await asyncio.sleep(secs)
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+def autodel(chat_id, msg, secs=None):
+    secs = int(cfg(chat_id, "autodelete")) if secs is None else secs
+    if secs > 0:
+        t = asyncio.create_task(_delete_later(msg, secs))
+        _tasks.add(t)
+        t.add_done_callback(_tasks.discard)
+
+
+async def say(message, text, **kw):
+    m = await message.reply_text(text, **kw)
+    autodel(message.chat.id, m)
+    return m
+
+
+async def is_admin(client, chat_id, user_id):
+    try:
+        m = await client.get_chat_member(chat_id, user_id)
+        return m.status in ADMIN
+    except RPCError:
+        return False
+
+
+async def admin_ids(client, chat_id):
+    ts, ids = admin_cache.get(chat_id, (0, set()))
+    if time.time() - ts < 60:
+        return ids
+    ids = set()
+    try:
+        async for m in client.get_chat_members(
+            chat_id, filter=enums.ChatMembersFilter.ADMINISTRATORS
+        ):
+            ids.add(m.user.id)
+    except RPCError:
+        pass
+    admin_cache[chat_id] = (time.time(), ids)
+    return ids
+
+
+def admin_only(func):
+    @wraps(func)
+    async def wrapper(client, message):
+        anon = message.sender_chat and message.sender_chat.id == message.chat.id
+        if not anon:
+            if not message.from_user or not await is_admin(
+                client, message.chat.id, message.from_user.id
+            ):
+                return await say(message, "⛔ Ye command sirf admins ke liye hai.")
+        return await func(client, message)
+
+    return wrapper
+
+
+def parse_time(s):
+    m = re.fullmatch(r"(\d+)([smhdw])", s.lower())
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2)
+    return timedelta(**{{"s": "seconds", "m": "minutes", "h": "hours", "d": "days", "w": "weeks"}[unit]: n})
+
+
+async def get_target(client, message):
+    args = message.command[1:]
+    r = message.reply_to_message
+    if r and r.from_user:
+        return r.from_user, args
+    if not args:
+        return None, []
+    try:
+        ref = int(args[0]) if args[0].lstrip("-").isdigit() else args[0]
+        return await client.get_users(ref), args[1:]
+    except Exception:
+        return None, args
+
+
+async def prep(client, message):
+    user, rest = await get_target(client, message)
+    if not user:
+        await say(message, "⚠️ Kisi user ko reply karein ya ID/@username dein.")
+        return None
+    if user.id == await my_id(client):
+        await say(message, "😅 Main khud par ye action nahi kar sakta.")
+        return None
+    if await is_admin(client, message.chat.id, user.id):
+        await say(message, "⚠️ Admin par ye action nahi ho sakta.")
+        return None
+    return user, rest
+
+
+async def unrestrict(client, chat_id, user_id):
+    chat = await client.get_chat(chat_id)
+    perms = chat.permissions or ChatPermissions(can_send_messages=True)
+    await client.restrict_chat_member(chat_id, user_id, perms)
+
+
+async def kick(client, chat_id, user_id):
+    await client.ban_chat_member(chat_id, user_id)
+    await client.unban_chat_member(chat_id, user_id)
+
+
+async def punish(client, chat_id, user_id, action):
+    """Returns None on success, error text on failure."""
+    try:
+        if action == "ban":
+            await client.ban_chat_member(chat_id, user_id)
+        elif action == "kick":
+            await kick(client, chat_id, user_id)
+        else:
+            await client.restrict_chat_member(
+                chat_id, user_id, ChatPermissions(),
+                until_date=datetime.now() + timedelta(days=1),
+            )
+    except RPCError as e:
+        return err(e)
+    return None
+
+
+def fmt(text, user, chat, count=""):
+    name = html.escape(user.first_name or "User")
+    rep = {
+        "{first}": name,
+        "{mention}": f'<a href="tg://user?id={user.id}">{name}</a>',
+        "{id}": str(user.id),
+        "{username}": f"@{user.username}" if user.username else name,
+        "{chat}": html.escape(chat.title or ""),
+        "{count}": str(count),
+    }
+    for k, v in rep.items():
+        text = text.replace(k, v)
+    return text
+
+
+def text_arg(message):
+    parts = message.text.split(None, 1)
+    if len(parts) > 1:
+        return parts[1]
+    r = message.reply_to_message
+    if r:
+        return r.text or r.caption
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# /start /help
+# --------------------------------------------------------------------------- #
+HELP = """<b>🤖 Group Manager Bot</b> · v1.0
+
+<b>Moderation</b>
+/ban /unban /kick /mute [10m|2h|1d] /unmute
+/warn /unwarn /warns
+
+<b>Admin tools</b>
+/purge (reply karke) · /id · /info · /settings
+
+<b>Welcome &amp; Verification</b>
+/setwelcome &lt;text&gt; · /setgoodbye &lt;text&gt;
+/verify off|button|captcha
+/forcesub @channel [invite_link] | off
+Placeholders: {first} {mention} {id} {username} {chat} {count}
+
+<b>Group management</b>
+/stats · /setrules &lt;text&gt; · /rules
+/autodelete &lt;seconds&gt; (0 = off)
+/warnlimit &lt;n&gt; · /warnaction mute|kick|ban
+/addcmd &lt;name&gt; &lt;reply&gt; · /delcmd &lt;name&gt; · /cmds
+
+<b>Automod (advanced)</b>
+/lock &lt;type&gt; · /unlock &lt;type|all&gt; · /locks
+/antilink on|off · /antibot on|off
+/setflood &lt;n&gt; · /antiraid &lt;n&gt;
+/addblacklist &lt;word&gt; · /rmblacklist &lt;word&gt; · /blacklist
+/approve · /unapprove · /approved
+
+<b>Extra tools</b>
+/report · /admins · /pin · /unpin · /unpinall
+/slowmode &lt;sec|off&gt; · /promote · /demote (owner)
+/setlog &lt;channel_id&gt; | off
+
+Bot ko group me <b>admin</b> banayein (delete, restrict, ban, invite permissions ke saath).
+
+👨‍💻 Created by @roaroic0"""
+
+
+@app.on_message(filters.command(["start", "help"]))
+async def start_cmd(client, message):
+    me = await client.get_me()
+    rows = []
+    add_url = (
+        f"https://t.me/{me.username}?startgroup=true"
+        "&admin=delete_messages+restrict_members+invite_users+pin_messages+promote_members+manage_chat"
+    )
+    rows.append([Btn("➕ Apne Group me add karein", url=add_url)])
+    rows.append([Btn("📢 Developer Channel", url="https://t.me/roaroic0")])
+    await message.reply_text(HELP, reply_markup=Kb(rows))
+
+
+# --------------------------------------------------------------------------- #
+# Moderation: ban / unban / kick / mute / unmute
+# --------------------------------------------------------------------------- #
+@app.on_message(filters.command("ban") & filters.group)
+@admin_only
+async def ban_cmd(client, message):
+    r = await prep(client, message)
+    if not r:
+        return
+    user, rest = r
+    try:
+        await client.ban_chat_member(message.chat.id, user.id)
+    except RPCError as e:
+        return await say(message, f"❌ Ban fail: <code>{err(e)}</code>")
+    reason = f"\nKaran: {html.escape(' '.join(rest))}" if rest else ""
+    await log_action(client, message.chat, f"🔨 <b>Ban</b>\nUser: {mention(user)} (<code>{user.id}</code>)\nBy: {actor(message)}{reason}")
+    await say(message, f"🔨 {mention(user)} ko <b>ban</b> kar diya gaya.{reason}")
+
+
+@app.on_message(filters.command("unban") & filters.group)
+@admin_only
+async def unban_cmd(client, message):
+    user, _ = await get_target(client, message)
+    if not user:
+        return await say(message, "⚠️ Reply karein ya ID/@username dein.")
+    try:
+        await client.unban_chat_member(message.chat.id, user.id)
+    except RPCError as e:
+        return await say(message, f"❌ Unban fail: <code>{err(e)}</code>")
+    await say(message, f"✅ {mention(user)} ko <b>unban</b> kar diya gaya.")
+
+
+@app.on_message(filters.command("kick") & filters.group)
+@admin_only
+async def kick_cmd(client, message):
+    r = await prep(client, message)
+    if not r:
+        return
+    user, _ = r
+    try:
+        await kick(client, message.chat.id, user.id)
+    except RPCError as e:
+        return await say(message, f"❌ Kick fail: <code>{err(e)}</code>")
+    await log_action(client, message.chat, f"👢 <b>Kick</b>\nUser: {mention(user)} (<code>{user.id}</code>)\nBy: {actor(message)}")
+    await say(message, f"👢 {mention(user)} ko group se <b>kick</b> kar diya gaya.")
+
+
+@app.on_message(filters.command("mute") & filters.group)
+@admin_only
+async def mute_cmd(client, message):
+    r = await prep(client, message)
+    if not r:
+        return
+    user, rest = r
+    delta = parse_time(rest[0]) if rest else None
+    dur_label = "permanent"
+    if delta:
+        dur_label = rest[0]
+        rest = rest[1:]
+    try:
+        if delta:
+            await client.restrict_chat_member(
+                message.chat.id, user.id, ChatPermissions(),
+                until_date=datetime.now() + delta,
+            )
+        else:
+            await client.restrict_chat_member(message.chat.id, user.id, ChatPermissions())
+    except RPCError as e:
+        return await say(message, f"❌ Mute fail: <code>{err(e)}</code>")
+    dur = f" ({dur_label})"
+    reason = f"\nKaran: {html.escape(' '.join(rest))}" if rest else ""
+    await log_action(client, message.chat, f"🔇 <b>Mute</b>{dur}\nUser: {mention(user)} (<code>{user.id}</code>)\nBy: {actor(message)}{reason}")
+    await say(message, f"🔇 {mention(user)} ko <b>mute</b> kar diya gaya{dur}.{reason}")
+
+
+@app.on_message(filters.command("unmute") & filters.group)
+@admin_only
+async def unmute_cmd(client, message):
+    user, _ = await get_target(client, message)
+    if not user:
+        return await say(message, "⚠️ Reply karein ya ID/@username dein.")
+    try:
+        await unrestrict(client, message.chat.id, user.id)
+    except RPCError as e:
+        return await say(message, f"❌ Unmute fail: <code>{err(e)}</code>")
+    await say(message, f"🔊 {mention(user)} ko <b>unmute</b> kar diya gaya.")
+
+
+# --------------------------------------------------------------------------- #
+# Warn system
+# --------------------------------------------------------------------------- #
+@app.on_message(filters.command("warn") & filters.group)
+@admin_only
+async def warn_cmd(client, message):
+    r = await prep(client, message)
+    if not r:
+        return
+    user, rest = r
+    cid = message.chat.id
+    count = set_warns(cid, user.id, get_warns(cid, user.id) + 1)
+    limit = int(cfg(cid, "warn_limit"))
+    reason = f"\nKaran: {html.escape(' '.join(rest))}" if rest else ""
+    await log_action(client, message.chat, f"⚠️ <b>Warn</b> ({count}/{limit})\nUser: {mention(user)} (<code>{user.id}</code>)\nBy: {actor(message)}{reason}")
+    if count >= limit:
+        action = cfg(cid, "warn_action")
+        problem = await punish(client, cid, user.id, action)
+        set_warns(cid, user.id, 0)
+        if problem:
+            return await say(message, f"❌ Action fail: <code>{problem}</code>")
+        return await say(
+            message,
+            f"🚫 {mention(user)} ke {count}/{limit} warns ho gaye → <b>{action}</b>.{reason}",
+        )
+    kb = Kb([[Btn("🗑 Warn hatao", callback_data=f"unwarn:{cid}:{user.id}")]])
+    await say(message, f"⚠️ {mention(user)} ko warn mila ({count}/{limit}).{reason}", reply_markup=kb)
+
+
+@app.on_message(filters.command("unwarn") & filters.group)
+@admin_only
+async def unwarn_cmd(client, message):
+    user, _ = await get_target(client, message)
+    if not user:
+        return await say(message, "⚠️ Reply karein ya ID/@username dein.")
+    n = set_warns(message.chat.id, user.id, get_warns(message.chat.id, user.id) - 1)
+    await say(message, f"✅ {mention(user)} ka ek warn hata diya gaya. Ab: {n}")
+
+
+@app.on_message(filters.command("warns") & filters.group)
+async def warns_cmd(client, message):
+    user, _ = await get_target(client, message)
+    user = user or message.from_user
+    if not user:
+        return
+    n = get_warns(message.chat.id, user.id)
+    await say(message, f"📋 {mention(user)} ke warns: {n}/{cfg(message.chat.id, 'warn_limit')}")
+
+
+@app.on_callback_query(filters.regex(r"^unwarn:"))
+async def unwarn_cb(client, cb):
+    _, chat_id, user_id = cb.data.split(":")
+    chat_id, user_id = int(chat_id), int(user_id)
+    if not await is_admin(client, chat_id, cb.from_user.id):
+        return await cb.answer("Sirf admins!", show_alert=True)
+    n = set_warns(chat_id, user_id, get_warns(chat_id, user_id) - 1)
+    await cb.message.edit_text(f"✅ Warn hata diya gaya (ab {n}) by {mention(cb.from_user)}.")
+
+
+# --------------------------------------------------------------------------- #
+# Admin tools: purge, id, info
+# --------------------------------------------------------------------------- #
+@app.on_message(filters.command("purge") & filters.group)
+@admin_only
+async def purge_cmd(client, message):
+    if not message.reply_to_message:
+        return await say(message, "⚠️ Jis message se delete shuru karna hai, us par reply karke /purge likhein.")
+    ids = list(range(message.reply_to_message.id, message.id + 1))
+    deleted = 0
+    for i in range(0, len(ids), 100):
+        try:
+            await client.delete_messages(message.chat.id, ids[i : i + 100])
+            deleted += len(ids[i : i + 100])
+        except RPCError:
+            pass
+    m = await client.send_message(message.chat.id, f"🧹 Purge complete ({deleted} messages).")
+    autodel(message.chat.id, m, 5)
+
+
+@app.on_message(filters.command("id"))
+async def id_cmd(client, message):
+    lines = []
+    r = message.reply_to_message
+    if r and r.from_user:
+        lines.append(f"👤 User ID: <code>{r.from_user.id}</code>")
+    elif message.from_user:
+        lines.append(f"👤 Aapki ID: <code>{message.from_user.id}</code>")
+    lines.append(f"💬 Chat ID: <code>{message.chat.id}</code>")
+    await say(message, "\n".join(lines))
+
+
+@app.on_message(filters.command("info") & filters.group)
+async def info_cmd(client, message):
+    user, _ = await get_target(client, message)
+    user = user or message.from_user
+    if not user:
+        return
+    cid = message.chat.id
+    try:
+        status = (await client.get_chat_member(cid, user.id)).status.name.title()
+    except RPCError:
+        status = "Unknown"
+    row = db.execute(
+        "SELECT messages FROM users WHERE chat_id=? AND user_id=?", (cid, user.id)
+    ).fetchone()
+    text = (
+        f"ℹ️ <b>User Info</b>\n"
+        f"Naam: {mention(user)}\n"
+        f"ID: <code>{user.id}</code>\n"
+        f"Username: {('@' + user.username) if user.username else '—'}\n"
+        f"Status: {status}\n"
+        f"Warns: {get_warns(cid, user.id)}/{cfg(cid, 'warn_limit')}\n"
+        f"Messages (is group me): {row[0] if row else 0}"
+    )
+    await say(message, text)
+
+
+# --------------------------------------------------------------------------- #
+# Settings panel + text settings
+# --------------------------------------------------------------------------- #
+AD_CYCLE = ["0", "30", "60", "300"]
+VERIFY_CYCLE = ["off", "button", "captcha"]
+ACTION_CYCLE = ["mute", "kick", "ban"]
+
+
+def panel(cid):
+    def onoff(k):
+        return "✅" if cfg(cid, k) == "1" else "❌"
+
+    ad = cfg(cid, "autodelete")
+    fs = cfg(cid, "forcesub") or "off"
+    return Kb(
+        [
+            [
+                Btn(f"👋 Welcome {onoff('welcome_on')}", callback_data="set:welcome_on"),
+                Btn(f"🚪 Goodbye {onoff('goodbye_on')}", callback_data="set:goodbye_on"),
+            ],
+            [
+                Btn(f"🛡 Verify: {cfg(cid, 'verify')}", callback_data="set:verify"),
+                Btn(f"🧹 Service clean {onoff('clean_service')}", callback_data="set:clean_service"),
+            ],
+            [
+                Btn(f"⚖️ Warn action: {cfg(cid, 'warn_action')}", callback_data="set:warn_action"),
+                Btn(f"⏱ Auto-delete: {ad + 's' if ad != '0' else 'off'}", callback_data="set:autodelete"),
+            ],
+            [
+                Btn("➖", callback_data="set:warn_dn"),
+                Btn(f"Warn limit: {cfg(cid, 'warn_limit')}", callback_data="set:noop"),
+                Btn("➕", callback_data="set:warn_up"),
+            ],
+            [
+                Btn(f"🔗 Anti-link {onoff('antilink')}", callback_data="set:antilink"),
+                Btn(f"🤖 Anti-bot {onoff('antibot')}", callback_data="set:antibot"),
+            ],
+            [Btn(f"🌊 Anti-flood: {'off' if cfg(cid, 'flood_limit') == '0' else cfg(cid, 'flood_limit') + ' msg/10s'}", callback_data="set:flood")],
+            [Btn(f"📢 Force sub: {fs}", callback_data="set:noop")],
+            [Btn("✖️ Close", callback_data="set:close")],
+        ]
+    )
+
+
+@app.on_message(filters.command("settings") & filters.group)
+@admin_only
+async def settings_cmd(client, message):
+    await message.reply_text("⚙️ <b>Group Settings</b>", reply_markup=panel(message.chat.id))
+
+
+@app.on_callback_query(filters.regex(r"^set:"))
+async def settings_cb(client, cb):
+    cid = cb.message.chat.id
+    if not await is_admin(client, cid, cb.from_user.id):
+        return await cb.answer("Sirf admins!", show_alert=True)
+    key = cb.data.split(":", 1)[1]
+    if key == "close":
+        return await cb.message.delete()
+    if key in ("welcome_on", "goodbye_on", "clean_service", "antilink", "antibot"):
+        setcfg(cid, key, "0" if cfg(cid, key) == "1" else "1")
+    elif key == "flood":
+        cur = cfg(cid, "flood_limit")
+        cur = cur if cur in FLOOD_CYCLE else "0"
+        setcfg(cid, "flood_limit", FLOOD_CYCLE[(FLOOD_CYCLE.index(cur) + 1) % len(FLOOD_CYCLE)])
+    elif key == "verify":
+        cur = cfg(cid, "verify")
+        setcfg(cid, "verify", VERIFY_CYCLE[(VERIFY_CYCLE.index(cur) + 1) % 3])
+    elif key == "warn_action":
+        cur = cfg(cid, "warn_action")
+        setcfg(cid, "warn_action", ACTION_CYCLE[(ACTION_CYCLE.index(cur) + 1) % 3])
+    elif key == "autodelete":
+        cur = cfg(cid, "autodelete")
+        cur = cur if cur in AD_CYCLE else "0"
+        setcfg(cid, "autodelete", AD_CYCLE[(AD_CYCLE.index(cur) + 1) % len(AD_CYCLE)])
+    elif key in ("warn_up", "warn_dn"):
+        n = int(cfg(cid, "warn_limit")) + (1 if key == "warn_up" else -1)
+        setcfg(cid, "warn_limit", min(10, max(1, n)))
+    try:
+        await cb.message.edit_reply_markup(panel(cid))
+    except RPCError:
+        pass
+    await cb.answer()
+
+
+@app.on_message(filters.command("setwelcome") & filters.group)
+@admin_only
+async def setwelcome_cmd(client, message):
+    t = text_arg(message)
+    if not t:
+        return await say(message, "Usage: /setwelcome &lt;text&gt;\nPlaceholders: {first} {mention} {id} {username} {chat} {count}")
+    setcfg(message.chat.id, "welcome_text", t)
+    setcfg(message.chat.id, "welcome_on", "1")
+    await say(message, "✅ Welcome message set ho gaya.")
+
+
+@app.on_message(filters.command("setgoodbye") & filters.group)
+@admin_only
+async def setgoodbye_cmd(client, message):
+    t = text_arg(message)
+    if not t:
+        return await say(message, "Usage: /setgoodbye &lt;text&gt;")
+    setcfg(message.chat.id, "goodbye_text", t)
+    setcfg(message.chat.id, "goodbye_on", "1")
+    await say(message, "✅ Goodbye message set ho gaya.")
+
+
+@app.on_message(filters.command("setrules") & filters.group)
+@admin_only
+async def setrules_cmd(client, message):
+    t = text_arg(message)
+    if not t:
+        return await say(message, "Usage: /setrules &lt;text&gt;")
+    setcfg(message.chat.id, "rules", t)
+    await say(message, "✅ Rules save ho gaye. Dekhne ke liye /rules")
+
+
+@app.on_message(filters.command("rules") & filters.group)
+async def rules_cmd(client, message):
+    r = cfg(message.chat.id, "rules")
+    await say(message, f"📜 <b>Group Rules</b>\n\n{r}" if r else "Abhi koi rules set nahi hain.")
+
+
+@app.on_callback_query(filters.regex(r"^rules:"))
+async def rules_cb(client, cb):
+    cid = int(cb.data.split(":")[1])
+    r = cfg(cid, "rules")
+    m = await client.send_message(cid, f"📜 <b>Group Rules</b>\n\n{r}" if r else "Koi rules set nahi hain.")
+    autodel(cid, m, 60)
+    await cb.answer()
+
+
+@app.on_message(filters.command("verify") & filters.group)
+@admin_only
+async def verify_cmd(client, message):
+    arg = message.command[1].lower() if len(message.command) > 1 else ""
+    if arg not in VERIFY_CYCLE:
+        return await say(message, "Usage: /verify off|button|captcha")
+    setcfg(message.chat.id, "verify", arg)
+    await say(message, f"🛡 Verification mode: <b>{arg}</b>")
+
+
+@app.on_message(filters.command("forcesub") & filters.group)
+@admin_only
+async def forcesub_cmd(client, message):
+    args = message.command[1:]
+    if not args:
+        return await say(message, "Usage: /forcesub @channel [invite_link] ya /forcesub off\n(Bot us channel me admin hona chahiye.)")
+    if args[0].lower() == "off":
+        setcfg(message.chat.id, "forcesub", "")
+        setcfg(message.chat.id, "forcesub_link", "")
+        return await say(message, "📢 Force subscribe band kar diya.")
+    ref = int(args[0]) if args[0].lstrip("-").isdigit() else args[0]
+    try:
+        ch = await client.get_chat(ref)
+        await client.get_chat_member(ch.id, await my_id(client))
+    except RPCError as e:
+        return await say(message, f"❌ Channel check fail (bot ko channel me admin banayein): <code>{err(e)}</code>")
+    link = args[1] if len(args) > 1 else (f"https://t.me/{ch.username}" if ch.username else "")
+    if not link:
+        return await say(message, "⚠️ Private channel hai - invite link bhi dein: /forcesub &lt;id&gt; &lt;invite_link&gt;")
+    setcfg(message.chat.id, "forcesub", ch.id)
+    setcfg(message.chat.id, "forcesub_link", link)
+    await say(message, f"📢 Force subscribe ON: <b>{html.escape(ch.title or str(ch.id))}</b>")
+
+
+@app.on_message(filters.command("autodelete") & filters.group)
+@admin_only
+async def autodelete_cmd(client, message):
+    if len(message.command) < 2 or not message.command[1].isdigit():
+        return await say(message, "Usage: /autodelete &lt;seconds&gt; (0 = off)\nBot ke replies aur welcome messages itne seconds baad delete honge.")
+    setcfg(message.chat.id, "autodelete", int(message.command[1]))
+    await say(message, f"⏱ Auto-delete: {message.command[1]}s")
+
+
+@app.on_message(filters.command("warnlimit") & filters.group)
+@admin_only
+async def warnlimit_cmd(client, message):
+    if len(message.command) < 2 or not message.command[1].isdigit() or not 1 <= int(message.command[1]) <= 10:
+        return await say(message, "Usage: /warnlimit &lt;1-10&gt;")
+    setcfg(message.chat.id, "warn_limit", int(message.command[1]))
+    await say(message, f"⚖️ Warn limit: {message.command[1]}")
+
+
+@app.on_message(filters.command("warnaction") & filters.group)
+@admin_only
+async def warnaction_cmd(client, message):
+    arg = message.command[1].lower() if len(message.command) > 1 else ""
+    if arg not in ACTION_CYCLE:
+        return await say(message, "Usage: /warnaction mute|kick|ban")
+    setcfg(message.chat.id, "warn_action", arg)
+    await say(message, f"⚖️ Warn limit par action: <b>{arg}</b>")
+
+
+# --------------------------------------------------------------------------- #
+# Custom commands
+# --------------------------------------------------------------------------- #
+@app.on_message(filters.command("addcmd") & filters.group)
+@admin_only
+async def addcmd_cmd(client, message):
+    parts = message.text.split(None, 2)
+    if len(parts) < 2:
+        return await say(message, "Usage: /addcmd &lt;name&gt; &lt;reply text&gt; (ya kisi message par reply karke)")
+    name = parts[1].lower().lstrip("/")
+    reply = parts[2] if len(parts) > 2 else (
+        (message.reply_to_message.text or message.reply_to_message.caption)
+        if message.reply_to_message else None
+    )
+    if not re.fullmatch(r"[a-z0-9_]{1,32}", name) or name in RESERVED:
+        return await say(message, "⚠️ Naam invalid hai ya reserved hai (a-z, 0-9, _ only).")
+    if not reply:
+        return await say(message, "⚠️ Reply text dein.")
+    db.execute("INSERT OR REPLACE INTO cmds VALUES (?,?,?)", (message.chat.id, name, reply))
+    db.commit()
+    await say(message, f"✅ Custom command <code>/{name}</code> add ho gaya.")
+
+
+@app.on_message(filters.command("delcmd") & filters.group)
+@admin_only
+async def delcmd_cmd(client, message):
+    if len(message.command) < 2:
+        return await say(message, "Usage: /delcmd &lt;name&gt;")
+    name = message.command[1].lower().lstrip("/")
+    cur = db.execute("DELETE FROM cmds WHERE chat_id=? AND name=?", (message.chat.id, name))
+    db.commit()
+    await say(message, "🗑 Delete ho gaya." if cur.rowcount else "Aisa koi command nahi mila.")
+
+
+@app.on_message(filters.command("cmds") & filters.group)
+async def cmds_cmd(client, message):
+    rows = db.execute("SELECT name FROM cmds WHERE chat_id=? ORDER BY name", (message.chat.id,)).fetchall()
+    await say(message, "📌 <b>Custom commands</b>\n" + "\n".join(f"/{r[0]}" for r in rows) if rows else "Koi custom command nahi hai.")
+
+
+@app.on_message(filters.group & filters.text, group=3)
+async def custom_cmd_handler(client, message):
+    text = message.text or ""
+    if not text.startswith("/"):
+        return
+    name = text[1:].split()[0].split("@")[0].lower()
+    row = db.execute("SELECT reply FROM cmds WHERE chat_id=? AND name=?", (message.chat.id, name)).fetchone()
+    if row:
+        await say(message, row[0])
+
+
+# --------------------------------------------------------------------------- #
+# Stats
+# --------------------------------------------------------------------------- #
+@app.on_message(filters.command("stats") & filters.group)
+async def stats_cmd(client, message):
+    cid = message.chat.id
+    try:
+        members = await client.get_chat_members_count(cid)
+    except RPCError:
+        members = "?"
+    day = time.strftime("%Y-%m-%d")
+    row = db.execute("SELECT joins, leaves, messages FROM stats WHERE chat_id=? AND day=?", (cid, day)).fetchone() or (0, 0, 0)
+    week = db.execute(
+        "SELECT SUM(joins), SUM(leaves), SUM(messages) FROM stats WHERE chat_id=? AND day>=?",
+        (cid, time.strftime("%Y-%m-%d", time.localtime(time.time() - 6 * 86400))),
+    ).fetchone()
+    top = db.execute(
+        "SELECT name, messages FROM users WHERE chat_id=? ORDER BY messages DESC LIMIT 5", (cid,)
+    ).fetchall()
+    text = (
+        f"📊 <b>Group Stats</b>\n"
+        f"👥 Total members: {members}\n\n"
+        f"<b>Aaj</b>: +{row[0]} joins · -{row[1]} leaves · {row[2]} messages\n"
+        f"<b>7 din</b>: +{week[0] or 0} joins · -{week[1] or 0} leaves · {week[2] or 0} messages\n"
+    )
+    if top:
+        text += "\n🏆 <b>Top active</b>\n" + "\n".join(
+            f"{i}. {html.escape(n or 'User')} — {m}" for i, (n, m) in enumerate(top, 1)
+        )
+    await say(message, text)
+
+
+@app.on_message(filters.group & ~filters.service, group=4)
+async def count_messages(client, message):
+    u = message.from_user
+    if not u or u.is_bot:
+        return
+    bump(message.chat.id, "messages")
+    db.execute("INSERT OR IGNORE INTO users(chat_id, user_id, name) VALUES (?,?,?)", (message.chat.id, u.id, u.first_name))
+    db.execute(
+        "UPDATE users SET messages=messages+1, name=? WHERE chat_id=? AND user_id=?",
+        (u.first_name, message.chat.id, u.id),
+    )
+    db.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Join / leave / verification
+# --------------------------------------------------------------------------- #
+async def send_welcome(client, chat, user):
+    cid = chat.id
+    if cfg(cid, "welcome_on") != "1":
+        return
+    try:
+        count = await client.get_chat_members_count(cid)
+    except RPCError:
+        count = ""
+    kb = Kb([[Btn("📜 Rules", callback_data=f"rules:{cid}")]]) if cfg(cid, "rules") else None
+    m = await client.send_message(cid, fmt(cfg(cid, "welcome_text"), user, chat, count), reply_markup=kb)
+    autodel(cid, m)
+
+
+async def verify_timeout(client, chat_id, user_id, secs):
+    await asyncio.sleep(secs)
+    p = pending.pop((chat_id, user_id), None)
+    if p:
+        try:
+            await kick(client, chat_id, user_id)
+            await client.delete_messages(chat_id, p["msg"])
+        except RPCError:
+            pass
+
+
+async def start_verification(client, chat, user, mode):
+    cid = chat.id
+    try:
+        await client.restrict_chat_member(cid, user.id, ChatPermissions())
+    except RPCError:
+        return await send_welcome(client, chat, user)  # bot lacks rights -> skip verification
+    secs = int(cfg(cid, "verify_timeout"))
+    if mode == "button":
+        ans = "ok"
+        text = f"🛡 {mention(user)}, group me bolne ke liye neeche button dabayein.\n⏳ {secs} second ka time hai."
+        kb = Kb([[Btn("✅ Main insaan hoon", callback_data=f"cap:{cid}:{user.id}:ok")]])
+    else:
+        a, b = random.randint(1, 9), random.randint(1, 9)
+        ans = str(a + b)
+        opts = {a + b}
+        while len(opts) < 4:
+            opts.add(random.randint(2, 18))
+        opts = random.sample(sorted(opts), 4)
+        text = f"🛡 {mention(user)}, verify karein: <b>{a} + {b} = ?</b>\n⏳ {secs} second ka time hai."
+        kb = Kb([[Btn(str(o), callback_data=f"cap:{cid}:{user.id}:{o}") for o in opts]])
+    m = await client.send_message(cid, text, reply_markup=kb)
+    pending[(cid, user.id)] = {"ans": ans, "msg": m.id}
+    t = asyncio.create_task(verify_timeout(client, cid, user.id, secs))
+    _tasks.add(t)
+    t.add_done_callback(_tasks.discard)
+
+
+@app.on_message(filters.new_chat_members & filters.group)
+async def on_join(client, message):
+    chat = message.chat
+    me = await my_id(client)
+    for u in message.new_chat_members:
+        if u.id == me:
+            if await is_admin(client, chat.id, me):
+                note = "✅ Mere paas admin rights hain. /settings se setup karein, /help me saare commands hain."
+            else:
+                note = ("⚠️ Mujhe <b>admin</b> banayein (Delete messages, Restrict/Ban users, Invite users) "
+                        "tabhi main kaam karunga. Phir /settings se setup karein.")
+            await message.reply_text(f"👋 Thanks for adding me!\n{note}")
+            continue
+        if (chat.id, u.id) in kicked_set:
+            kicked_set.discard((chat.id, u.id))
+            continue
+        if u.is_bot:
+            continue
+        bump(chat.id, "joins")
+        mode = cfg(chat.id, "verify")
+        if mode != "off":
+            await start_verification(client, chat, u, mode)
+        else:
+            await send_welcome(client, chat, u)
+
+
+@app.on_callback_query(filters.regex(r"^cap:"))
+async def captcha_cb(client, cb):
+    _, chat_id, user_id, choice = cb.data.split(":")
+    chat_id, user_id = int(chat_id), int(user_id)
+    if cb.from_user.id != user_id:
+        return await cb.answer("Ye button aapke liye nahi hai.", show_alert=True)
+    p = pending.get((chat_id, user_id))
+    if not p:
+        return await cb.answer("Verification expire ho chuka hai.", show_alert=True)
+    pending.pop((chat_id, user_id), None)
+    if choice == p["ans"]:
+        try:
+            await unrestrict(client, chat_id, user_id)
+        except RPCError:
+            pass
+        await cb.answer("✅ Verified!")
+        chat = cb.message.chat
+        await cb.message.delete()
+        await send_welcome(client, chat, cb.from_user)
+    else:
+        await cb.answer("❌ Galat jawab. Dobara join karke try karein.", show_alert=True)
+        try:
+            await kick(client, chat_id, user_id)
+            await cb.message.delete()
+        except RPCError:
+            pass
+
+
+@app.on_message(filters.left_chat_member & filters.group)
+async def on_leave(client, message):
+    u = message.left_chat_member
+    if not u or u.is_bot:
+        return
+    bump(message.chat.id, "leaves")
+    if cfg(message.chat.id, "goodbye_on") == "1":
+        m = await client.send_message(message.chat.id, fmt(cfg(message.chat.id, "goodbye_text"), u, message.chat))
+        autodel(message.chat.id, m)
+
+
+@app.on_message(filters.service & filters.group, group=5)
+async def clean_service(client, message):
+    if cfg(message.chat.id, "clean_service") == "1":
+        try:
+            await message.delete()
+        except RPCError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# Force subscribe
+# --------------------------------------------------------------------------- #
+async def has_joined(client, channel, user_id):
+    key = (channel, user_id)
+    if time.time() - joined_cache.get(key, 0) < 60:
+        return True
+    try:
+        m = await client.get_chat_member(int(channel), user_id)
+    except RPCError as e:
+        # UserNotParticipant => not joined; anything else => don't block users
+        return "USER_NOT_PARTICIPANT" not in str(e).upper()
+    if m.status in (enums.ChatMemberStatus.LEFT, enums.ChatMemberStatus.BANNED):
+        return False
+    if m.status == enums.ChatMemberStatus.RESTRICTED and not getattr(m, "is_member", True):
+        return False
+    joined_cache[key] = time.time()
+    return True
+
+
+@app.on_message(filters.group & ~filters.service, group=-1)
+async def force_sub(client, message):
+    cid = message.chat.id
+    ch = cfg(cid, "forcesub")
+    u = message.from_user
+    if not ch or not u or u.is_bot:
+        return
+    if u.id in await admin_ids(client, cid):
+        return
+    if await has_joined(client, ch, u.id):
+        return
+    try:
+        await message.delete()
+    except RPCError:
+        pass
+    kb = Kb(
+        [
+            [Btn("📢 Channel join karein", url=cfg(cid, "forcesub_link"))],
+            [Btn("✅ Maine join kar liya", callback_data=f"fs:{cid}:{u.id}")],
+        ]
+    )
+    m = await client.send_message(
+        cid, f"⚠️ {mention(u)}, group me message karne ke liye pehle hamara channel join karein.", reply_markup=kb
+    )
+    autodel(cid, m, 30)
+    message.stop_propagation()
+
+
+@app.on_callback_query(filters.regex(r"^fs:"))
+async def forcesub_cb(client, cb):
+    _, chat_id, user_id = cb.data.split(":")
+    chat_id, user_id = int(chat_id), int(user_id)
+    if cb.from_user.id != user_id:
+        return await cb.answer("Ye button aapke liye nahi hai.", show_alert=True)
+    if await has_joined(client, cfg(chat_id, "forcesub"), user_id):
+        await cb.answer("✅ Thanks! Ab aap message kar sakte hain.", show_alert=True)
+        await cb.message.delete()
+    else:
+        await cb.answer("❌ Aapne abhi tak channel join nahi kiya.", show_alert=True)
+
+
+# --------------------------------------------------------------------------- #
+# ADVANCED: automod (locks, anti-link, blacklist, anti-flood), anti-raid,
+# anti-bot, approved users, log channel, report, pin, slowmode, promote...
+# --------------------------------------------------------------------------- #
+from pyrogram.types import ChatPrivileges  # noqa: E402
+
+db.executescript(
+    """
+CREATE TABLE IF NOT EXISTS approved (chat_id INTEGER, user_id INTEGER, PRIMARY KEY (chat_id, user_id));
+CREATE TABLE IF NOT EXISTS blacklist (chat_id INTEGER, word TEXT, PRIMARY KEY (chat_id, word));
+"""
+)
+db.commit()
+
+FLOOD_CYCLE = ["0", "5", "8", "12"]
+URL_RE = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/)\S+", re.I)
+flood = {}  # (chat_id, user_id) -> [timestamps]
+join_times = {}  # chat_id -> [timestamps]
+raid_until = {}  # chat_id -> timestamp
+kicked_set = set()  # (chat_id, user_id) kicked by join guard
+
+LOCKS = {
+    "sticker": lambda m: bool(m.sticker),
+    "photo": lambda m: bool(m.photo),
+    "video": lambda m: bool(m.video or m.video_note),
+    "document": lambda m: bool(m.document),
+    "audio": lambda m: bool(m.audio),
+    "voice": lambda m: bool(m.voice),
+    "gif": lambda m: bool(m.animation),
+    "poll": lambda m: bool(m.poll),
+    "contact": lambda m: bool(m.contact),
+    "forward": lambda m: bool(
+        getattr(m, "forward_date", None) or getattr(m, "forward_origin", None)
+    ),
+}
+
+
+def actor(message):
+    return mention(message.from_user) if message.from_user else "Anonymous admin"
+
+
+async def log_action(client, chat, text):
+    ch = cfg(chat.id, "logchan")
+    if not ch:
+        return
+    try:
+        await client.send_message(
+            int(ch), f"📂 <b>{html.escape(chat.title or str(chat.id))}</b>\n{text}"
+        )
+    except Exception:
+        pass
+
+
+def is_approved(chat_id, user_id):
+    return (
+        db.execute(
+            "SELECT 1 FROM approved WHERE chat_id=? AND user_id=?", (chat_id, user_id)
+        ).fetchone()
+        is not None
+    )
+
+
+def onoff_arg(message):
+    a = message.command[1].lower() if len(message.command) > 1 else ""
+    return {"on": "1", "off": "0", "yes": "1", "no": "0"}.get(a)
+
+
+def has_link(message):
+    text = message.text or message.caption or ""
+    if URL_RE.search(text):
+        return True
+    for ent in message.entities or message.caption_entities or []:
+        if ent.type in (enums.MessageEntityType.URL, enums.MessageEntityType.TEXT_LINK):
+            return True
+    return False
+
+
+async def violation(client, message, reason, warn=True):
+    """Delete the message, optionally warn (and punish at limit), then stop other handlers."""
+    cid = message.chat.id
+    user = message.from_user
+    try:
+        await message.delete()
+    except RPCError:
+        pass
+    await log_action(
+        client, message.chat,
+        f"🛡 <b>Automod</b>: {reason}\nUser: {mention(user)} (<code>{user.id}</code>)",
+    )
+    if warn:
+        count = set_warns(cid, user.id, get_warns(cid, user.id) + 1)
+        limit = int(cfg(cid, "warn_limit"))
+        if count >= limit:
+            action = cfg(cid, "warn_action")
+            problem = await punish(client, cid, user.id, action)
+            set_warns(cid, user.id, 0)
+            text = (
+                f"🚫 {mention(user)}: {reason} ({count}/{limit} warns) → <b>{action}</b>"
+                if not problem
+                else f"❌ Action fail: <code>{problem}</code>"
+            )
+        else:
+            text = f"⚠️ {mention(user)}, {reason}. Warn {count}/{limit}."
+    else:
+        text = f"⚠️ {mention(user)}, {reason}."
+    m = await client.send_message(cid, text)
+    autodel(cid, m, 10)
+    message.stop_propagation()
+
+
+@app.on_message(filters.group & ~filters.service, group=-2)
+async def automod(client, message):
+    u = message.from_user
+    if not u or u.is_bot:
+        return
+    cid = message.chat.id
+    if u.id in await admin_ids(client, cid) or is_approved(cid, u.id):
+        return
+
+    # 1) Locks (media types / forwards) -> delete only
+    for name in [x for x in cfg(cid, "locks").split(",") if x]:
+        fn = LOCKS.get(name)
+        if fn and fn(message):
+            return await violation(client, message, f"<b>{name}</b> yahan allowed nahi hai", warn=False)
+
+    # 2) Anti-link -> delete + warn
+    if cfg(cid, "antilink") == "1" and has_link(message):
+        return await violation(client, message, "links allowed nahi hain")
+
+    # 3) Blacklist words -> delete + warn
+    text = (message.text or message.caption or "").lower()
+    if text:
+        for (w,) in db.execute("SELECT word FROM blacklist WHERE chat_id=?", (cid,)).fetchall():
+            if w in text:
+                return await violation(client, message, "blacklisted word use kiya")
+
+    # 4) Anti-flood -> mute 5 minutes
+    limit = int(cfg(cid, "flood_limit"))
+    if limit:
+        now = time.time()
+        key = (cid, u.id)
+        lst = [t for t in flood.get(key, []) if now - t < 10]
+        lst.append(now)
+        flood[key] = lst
+        if len(lst) > limit:
+            flood[key] = []
+            try:
+                await client.restrict_chat_member(
+                    cid, u.id, ChatPermissions(),
+                    until_date=datetime.now() + timedelta(minutes=5),
+                )
+            except RPCError:
+                return
+            m = await client.send_message(cid, f"🌊 {mention(u)} flood karne par 5 minute ke liye mute.")
+            autodel(cid, m, 10)
+            await log_action(client, message.chat, f"🌊 <b>Flood mute</b>: {mention(u)} (<code>{u.id}</code>)")
+            message.stop_propagation()
+
+
+# ----- Join guard: anti-bot + anti-raid ------------------------------------ #
+@app.on_message(filters.new_chat_members & filters.group, group=-3)
+async def join_guard(client, message):
+    cid = message.chat.id
+    me = await my_id(client)
+    admins = await admin_ids(client, cid)
+    now = time.time()
+    for u in message.new_chat_members:
+        if u.id == me:
+            continue
+        if u.is_bot:
+            if cfg(cid, "antibot") != "1":
+                continue
+            adder = message.from_user
+            if adder and adder.id != u.id and adder.id in admins:
+                continue  # admin ne khud bot add kiya
+            try:
+                await kick(client, cid, u.id)
+                kicked_set.add((cid, u.id))
+                m = await client.send_message(cid, f"🤖 Bot {mention(u)} hata diya gaya (anti-bot ON).")
+                autodel(cid, m, 10)
+                await log_action(client, message.chat, f"🤖 <b>Anti-bot</b>: {mention(u)} removed")
+            except RPCError:
+                pass
+            continue
+
+        limit = int(cfg(cid, "raid_limit"))
+        if not limit:
+            continue
+        lst = [t for t in join_times.get(cid, []) if now - t < 30]
+        lst.append(now)
+        join_times[cid] = lst
+        if len(lst) > limit and raid_until.get(cid, 0) < now:
+            raid_until[cid] = now + 300
+            m = await client.send_message(cid, "🚨 <b>Raid detected!</b> Agle 5 minute naye members auto-kick honge.")
+            autodel(cid, m, 30)
+            await log_action(client, message.chat, "🚨 <b>Raid mode ON</b> (5 min)")
+        if raid_until.get(cid, 0) > now:
+            try:
+                await kick(client, cid, u.id)
+                kicked_set.add((cid, u.id))
+            except RPCError:
+                pass
+
+
+# ----- Approved users ------------------------------------------------------ #
+@app.on_message(filters.command("approve") & filters.group)
+@admin_only
+async def approve_cmd(client, message):
+    user, _ = await get_target(client, message)
+    if not user:
+        return await say(message, "⚠️ Reply karein ya ID/@username dein.")
+    db.execute("INSERT OR IGNORE INTO approved VALUES (?,?)", (message.chat.id, user.id))
+    db.commit()
+    await say(message, f"✅ {mention(user)} approve ho gaya (automod se exempt).")
+
+
+@app.on_message(filters.command("unapprove") & filters.group)
+@admin_only
+async def unapprove_cmd(client, message):
+    user, _ = await get_target(client, message)
+    if not user:
+        return await say(message, "⚠️ Reply karein ya ID/@username dein.")
+    db.execute("DELETE FROM approved WHERE chat_id=? AND user_id=?", (message.chat.id, user.id))
+    db.commit()
+    await say(message, f"🗑 {mention(user)} ka approval hata diya.")
+
+
+@app.on_message(filters.command("approved") & filters.group)
+@admin_only
+async def approved_cmd(client, message):
+    rows = db.execute(
+        "SELECT a.user_id, u.name FROM approved a LEFT JOIN users u "
+        "ON u.chat_id=a.chat_id AND u.user_id=a.user_id WHERE a.chat_id=?",
+        (message.chat.id,),
+    ).fetchall()
+    if not rows:
+        return await say(message, "Koi approved user nahi hai.")
+    await say(message, "✅ <b>Approved users</b>\n" + "\n".join(
+        f'• <a href="tg://user?id={i}">{html.escape(n or str(i))}</a>' for i, n in rows))
+
+
+# ----- Locks --------------------------------------------------------------- #
+@app.on_message(filters.command("lock") & filters.group)
+@admin_only
+async def lock_cmd(client, message):
+    arg = message.command[1].lower() if len(message.command) > 1 else ""
+    if arg not in LOCKS:
+        return await say(message, "Usage: /lock &lt;type&gt;\nTypes: " + ", ".join(sorted(LOCKS)))
+    cid = message.chat.id
+    cur = {x for x in cfg(cid, "locks").split(",") if x}
+    cur.add(arg)
+    setcfg(cid, "locks", ",".join(sorted(cur)))
+    await say(message, f"🔒 <b>{arg}</b> lock ho gaya.")
+
+
+@app.on_message(filters.command("unlock") & filters.group)
+@admin_only
+async def unlock_cmd(client, message):
+    arg = message.command[1].lower() if len(message.command) > 1 else ""
+    cid = message.chat.id
+    if arg == "all":
+        setcfg(cid, "locks", "")
+        return await say(message, "🔓 Saare locks hata diye.")
+    if arg not in LOCKS:
+        return await say(message, "Usage: /unlock &lt;type|all&gt;")
+    cur = {x for x in cfg(cid, "locks").split(",") if x}
+    cur.discard(arg)
+    setcfg(cid, "locks", ",".join(sorted(cur)))
+    await say(message, f"🔓 <b>{arg}</b> unlock ho gaya.")
+
+
+@app.on_message(filters.command("locks") & filters.group)
+async def locks_cmd(client, message):
+    cur = {x for x in cfg(message.chat.id, "locks").split(",") if x}
+    lines = [f"{'🔒' if n in cur else '🔓'} {n}" for n in sorted(LOCKS)]
+    await say(message, "<b>Locks</b>\n" + "\n".join(lines))
+
+
+# ----- Toggles / limits ---------------------------------------------------- #
+@app.on_message(filters.command("antilink") & filters.group)
+@admin_only
+async def antilink_cmd(client, message):
+    v = onoff_arg(message)
+    if v is None:
+        return await say(message, "Usage: /antilink on|off")
+    setcfg(message.chat.id, "antilink", v)
+    await say(message, f"🔗 Anti-link: <b>{'ON' if v == '1' else 'OFF'}</b>")
+
+
+@app.on_message(filters.command("antibot") & filters.group)
+@admin_only
+async def antibot_cmd(client, message):
+    v = onoff_arg(message)
+    if v is None:
+        return await say(message, "Usage: /antibot on|off\n(Non-admin dwara add kiye gaye bots hata diye jayenge.)")
+    setcfg(message.chat.id, "antibot", v)
+    await say(message, f"🤖 Anti-bot: <b>{'ON' if v == '1' else 'OFF'}</b>")
+
+
+@app.on_message(filters.command("setflood") & filters.group)
+@admin_only
+async def setflood_cmd(client, message):
+    if len(message.command) < 2 or not message.command[1].isdigit() or int(message.command[1]) > 30:
+        return await say(message, "Usage: /setflood &lt;0-30&gt;\nUser 10 second me itne se zyada messages bheje to 5 min mute. 0 = off.")
+    setcfg(message.chat.id, "flood_limit", int(message.command[1]))
+    await say(message, f"🌊 Anti-flood: {message.command[1]} msg/10s")
+
+
+@app.on_message(filters.command("antiraid") & filters.group)
+@admin_only
+async def antiraid_cmd(client, message):
+    if len(message.command) < 2 or not message.command[1].isdigit() or int(message.command[1]) > 100:
+        return await say(message, "Usage: /antiraid &lt;0-100&gt;\n30 second me itne se zyada joins hone par 5 min ke liye naye members auto-kick. 0 = off.")
+    setcfg(message.chat.id, "raid_limit", int(message.command[1]))
+    await say(message, f"🚨 Anti-raid limit: {message.command[1]} joins/30s")
+
+
+# ----- Blacklist ----------------------------------------------------------- #
+@app.on_message(filters.command("addblacklist") & filters.group)
+@admin_only
+async def addblacklist_cmd(client, message):
+    parts = message.text.split(None, 1)
+    if len(parts) < 2 or len(parts[1]) > 50:
+        return await say(message, "Usage: /addblacklist &lt;word ya phrase&gt;")
+    db.execute("INSERT OR IGNORE INTO blacklist VALUES (?,?)", (message.chat.id, parts[1].strip().lower()))
+    db.commit()
+    await say(message, "✅ Blacklist me add ho gaya.")
+
+
+@app.on_message(filters.command("rmblacklist") & filters.group)
+@admin_only
+async def rmblacklist_cmd(client, message):
+    parts = message.text.split(None, 1)
+    if len(parts) < 2:
+        return await say(message, "Usage: /rmblacklist &lt;word&gt;")
+    cur = db.execute("DELETE FROM blacklist WHERE chat_id=? AND word=?", (message.chat.id, parts[1].strip().lower()))
+    db.commit()
+    await say(message, "🗑 Hata diya." if cur.rowcount else "Ye word blacklist me nahi mila.")
+
+
+@app.on_message(filters.command("blacklist") & filters.group)
+@admin_only
+async def blacklist_cmd(client, message):
+    rows = db.execute("SELECT word FROM blacklist WHERE chat_id=? ORDER BY word", (message.chat.id,)).fetchall()
+    await say(message, "🚫 <b>Blacklist</b>\n" + "\n".join(f"• {html.escape(r[0])}" for r in rows) if rows else "Blacklist khali hai.")
+
+
+# ----- Log channel --------------------------------------------------------- #
+@app.on_message(filters.command("setlog") & filters.group)
+@admin_only
+async def setlog_cmd(client, message):
+    if len(message.command) < 2:
+        return await say(message, "Usage: /setlog &lt;channel_id|@channel&gt; ya /setlog off\n(Bot us channel me admin hona chahiye.)")
+    if message.command[1].lower() == "off":
+        setcfg(message.chat.id, "logchan", "")
+        return await say(message, "📝 Log channel band.")
+    a = message.command[1]
+    try:
+        ch = await client.get_chat(int(a) if a.lstrip("-").isdigit() else a)
+        await client.send_message(ch.id, f"✅ Log channel connected: <b>{html.escape(message.chat.title or '')}</b>")
+    except Exception as e:
+        return await say(message, f"❌ Channel me message nahi bhej paya (bot admin hai?): <code>{err(e)}</code>")
+    setcfg(message.chat.id, "logchan", ch.id)
+    await say(message, "📝 Log channel set ho gaya. Ban/mute/kick/warn/automod ke logs wahan aayenge.")
+
+
+# ----- Report / admins ----------------------------------------------------- #
+@app.on_message(filters.command("report") & filters.group)
+async def report_cmd(client, message):
+    r = message.reply_to_message
+    if not r:
+        return await say(message, "⚠️ Jis message ko report karna hai us par reply karke /report likhein.")
+    cid = message.chat.id
+    me = await my_id(client)
+    ids = [i for i in await admin_ids(client, cid) if i != me][:10]
+    tags = "".join(f'<a href="tg://user?id={i}">\u200b</a>' for i in ids)
+    try:
+        link = r.link
+    except Exception:
+        link = None
+    text = f"🚨 <b>Report</b> by {actor(message)}{tags}"
+    if link:
+        text += f'\n<a href="{link}">Message dekhein</a>'
+    await client.send_message(cid, text, reply_to_message_id=r.id)
+    await log_action(client, message.chat, f"🚨 <b>Report</b> by {actor(message)}" + (f"\n{link}" if link else ""))
+
+
+@app.on_message(filters.command("admins") & filters.group)
+async def admins_cmd(client, message):
+    lines = []
+    try:
+        async for m in client.get_chat_members(
+            message.chat.id, filter=enums.ChatMembersFilter.ADMINISTRATORS
+        ):
+            if m.user.is_bot:
+                continue
+            icon = "👑" if m.status == enums.ChatMemberStatus.OWNER else "👮"
+            lines.append(f"{icon} {mention(m.user)}")
+    except RPCError as e:
+        return await say(message, f"❌ <code>{err(e)}</code>")
+    await say(message, "<b>Group Admins</b>\n" + ("\n".join(lines) or "—"))
+
+
+# ----- Pin / promote -------------------------------------------------------- # #
+@app.on_message(filters.command("slowmode") & filters.group)
+@admin_only
+async def slowmode_cmd(client, message):
+    valid = {0, 10, 30, 60, 300, 900, 3600}
+    arg = message.command[1].lower() if len(message.command) > 1 else ""
+    if arg == "off":
+        arg = "0"
+    if not arg.isdigit() or int(arg) not in valid:
+        return await say(message, "Usage: /slowmode &lt;10|30|60|300|900|3600&gt; (seconds) ya /slowmode off")
+    n = int(arg)
+    try:
+        await client.set_slow_mode(message.chat.id, n or None)
+    except RPCError as e:
+        return await say(message, f"❌ <code>{err(e)}</code>")
+    await say(message, f"🐢 Slowmode: {n}s" if n else "🐢 Slowmode <b>OFF</b> kar diya gaya.")
+
+
+@app.on_message(filters.command("pin") & filters.group)
+@admin_only
+async def pin_cmd(client, message):
+    r = message.reply_to_message
+    if not r:
+        return await say(message, "⚠️ Jis message ko pin karna hai us par reply karein. (Notification ke liye: /pin loud)")
+    loud = len(message.command) > 1 and message.command[1].lower() == "loud"
+    try:
+        await client.pin_chat_message(message.chat.id, r.id, disable_notification=not loud)
+    except RPCError as e:
+        await say(message, f"❌ <code>{err(e)}</code>")
+
+
+@app.on_message(filters.command("unpin") & filters.group)
+@admin_only
+async def unpin_cmd(client, message):
+    r = message.reply_to_message
+    if not r:
+        return await say(message, "⚠️ Jis message ko unpin karna hai us par reply karein.")
+    try:
+        await client.unpin_chat_message(message.chat.id, r.id)
+    except RPCError as e:
+        await say(message, f"❌ <code>{err(e)}</code>")
+
+
+@app.on_message(filters.command("unpinall") & filters.group)
+@admin_only
+async def unpinall_cmd(client, message):
+    try:
+        await client.unpin_all_chat_messages(message.chat.id)
+        await say(message, "📌 Saare pinned messages hata diye.")
+    except RPCError as e:
+        await say(message, f"❌ <code>{err(e)}</code>")
+
+
+async def _owner_only(client, message):
+    if not message.from_user:
+        return False
+    try:
+        m = await client.get_chat_member(message.chat.id, message.from_user.id)
+    except RPCError:
+        return False
+    if m.status != enums.ChatMemberStatus.OWNER:
+        await say(message, "⛔ Ye command sirf group owner chala sakta hai.")
+        return False
+    return True
+
+
+@app.on_message(filters.command("promote") & filters.group)
+async def promote_cmd(client, message):
+    if not await _owner_only(client, message):
+        return
+    user, _ = await get_target(client, message)
+    if not user:
+        return await say(message, "⚠️ Reply karein ya ID/@username dein.")
+    try:
+        await client.promote_chat_member(
+            message.chat.id, user.id,
+            ChatPrivileges(
+                can_manage_chat=True, can_delete_messages=True,
+                can_restrict_members=True, can_invite_users=True, can_pin_messages=True,
+            ),
+        )
+    except RPCError as e:
+        return await say(message, f"❌ <code>{err(e)}</code>")
+    admin_cache.pop(message.chat.id, None)
+    await say(message, f"👮 {mention(user)} ab admin hai.")
+    await log_action(client, message.chat, f"👮 <b>Promote</b>: {mention(user)} by {actor(message)}")
+
+
+@app.on_message(filters.command("demote") & filters.group)
+async def demote_cmd(client, message):
+    if not await _owner_only(client, message):
+        return
+    user, _ = await get_target(client, message)
+    if not user:
+        return await say(message, "⚠️ Reply karein ya ID/@username dein.")
+    try:
+        await client.promote_chat_member(message.chat.id, user.id, ChatPrivileges(can_manage_chat=False))
+    except RPCError as e:
+        return await say(message, f"❌ <code>{err(e)}</code>")
+    admin_cache.pop(message.chat.id, None)
+    await say(message, f"⬇️ {mention(user)} ab admin nahi raha.")
+    await log_action(client, message.chat, f"⬇️ <b>Demote</b>: {mention(user)} by {actor(message)}")
+
+
+if __name__ == "__main__":
+    print(f"Group Manager Bot v{__version__} (created by @roaroic0) starting...")
+    app.run()
