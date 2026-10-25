@@ -1546,6 +1546,43 @@ async def demote_cmd(client, message):
     await log_action(client, message.chat, f"⬇️ <b>Demote</b>: {mention(user)} by {actor(message)}")
 
 
+# --------------------------------------------------------------------------- #
+# Keep-alive web server (Render/Koyeb/Heroku jaise Web Service hosts ke liye)
+# Sirf tab chalta hai jab PORT environment variable set ho.
+# --------------------------------------------------------------------------- #
+import threading  # noqa: E402
+from http.server import BaseHTTPRequestHandler, HTTPServer  # noqa: E402
+
+
+class _PingHandler(BaseHTTPRequestHandler):
+    def _ok(self, body=b""):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def do_GET(self):
+        self._ok(f"Group Manager Bot v{__version__} is running".encode())
+
+    def do_HEAD(self):
+        self._ok()
+
+    def log_message(self, *args):
+        pass
+
+
+def start_keepalive():
+    port = os.environ.get("PORT")
+    if not port:
+        return
+    server = HTTPServer(("0.0.0.0", int(port)), _PingHandler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    print(f"Keep-alive server listening on port {port}")
+
+
 if __name__ == "__main__":
     print(f"Group Manager Bot v{__version__} (created by @roaroic0) starting...")
+    start_keepalive()
     app.run()

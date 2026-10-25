@@ -142,6 +142,15 @@ admins - Admin list
 
 Bot ko 24x7 chalane ke liye VPS ya hosting par `python group_manager_bot.py` chalayein (jaise `screen`, `pm2` ya systemd ke saath).
 
+## ☁️ Render par deploy
+
+- **Build Command:** `pip install -r requirements.txt`
+- **Start Command:** `python group_manager_bot.py`
+- **Environment:** `API_ID`, `API_HASH`, `BOT_TOKEN`, `PYTHON_VERSION=3.11.9`
+- **Web Service** par chalane par bot khud ek chhota keep-alive server `PORT` par chalata hai, isliye "No open ports detected" error nahi aata.
+- Free Web Service 15 minute idle rehne par so jati hai. [UptimeRobot](https://uptimerobot.com) me apne Render URL ka HTTP monitor 5 minute interval par lagayein.
+- Render ka disk restart par khali ho jata hai, isliye `group_manager.db` (settings/warns) reset ho sakta hai. Permanent data ke liye Persistent Disk ya external database lagayein.
+
 ## ⚠️ Dhyan rakhein
 
 - Force subscribe ke liye bot us **channel me bhi admin** hona chahiye.
