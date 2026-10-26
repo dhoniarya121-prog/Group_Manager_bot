@@ -21,7 +21,14 @@ from datetime import datetime, timedelta
 from functools import wraps
 
 from dotenv import load_dotenv
-from pyrogram import Client, enums, filters
+
+# Python 3.10+/3.14 par pyrogram import se pehle ek event loop zaroori hai
+try:
+    asyncio.get_running_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+from pyrogram import Client, enums, filters  # noqa: E402
 from pyrogram.errors import RPCError
 from pyrogram.types import ChatPermissions
 from pyrogram.types import InlineKeyboardButton as Btn
