@@ -83,6 +83,14 @@ DEFAULTS = {
     "warn_limit": "3",
     "warn_action": "mute",  # mute | kick | ban
     "antilink": "0",
+    "antirepeat": "0",
+    "levels": "1",
+    "night_on": "0",
+    "night_start": "23:00",
+    "night_end": "06:00",
+    "night_state": "0",
+    "tz": "+05:30",
+    "link_mentions": "1",  # anti-link me @username bhi block
     "antibot": "0",
     "flood_limit": "0",  # msgs per 10s, 0 = off
     "raid_limit": "0",  # joins per 30s, 0 = off
@@ -138,7 +146,8 @@ RESERVED = {
     "approve", "unapprove", "approved", "lock", "unlock", "locks", "antilink",
     "antibot", "setflood", "antiraid", "addblacklist", "rmblacklist", "blacklist",
     "setlog", "report", "admins", "slowmode", "pin", "unpin", "unpinall",
-    "promote", "demote", "panel", "broadcast", "filter", "filters", "stopfilter",
+    "promote", "demote", "antimention", "tban", "lockdown", "nightmode", "timezone", "schedule", "repeat",
+    "schedules", "unschedule", "rank", "top", "levels", "antirepeat", "panel", "broadcast", "filter", "filters", "stopfilter",
 }
 
 _tasks = set()
@@ -338,7 +347,7 @@ Placeholders: {first} {mention} {id} {username} {chat} {count}
 
 <b>Automod (advanced)</b>
 /lock &lt;type&gt; · /unlock &lt;type|all&gt; · /locks
-/antilink on|off · /antibot on|off
+/antilink on|off · /antimention on|off · /antibot on|off
 /setflood &lt;n&gt; · /antiraid &lt;n&gt;
 /addblacklist &lt;word&gt; · /rmblacklist &lt;word&gt; · /blacklist
 /approve · /unapprove · /approved
@@ -956,6 +965,8 @@ db.commit()
 
 FLOOD_CYCLE = ["0", "5", "8", "12"]
 URL_RE = re.compile(r"(https?://|www\.|t\.me/|telegram\.me/)\S+", re.I)
+DOMAIN_RE = re.compile(r"\b[\w-]+\.(?:com|in|net|org|io|me|xyz|info|link|co|app|ly|gg|site|online|shop|top|club|vip)\b", re.I)
+MENTION_RE = re.compile(r"(?<![\w])@[A-Za-z][A-Za-z0-9_]{4,31}\b")
 flood = {}  # (chat_id, user_id) -> [timestamps]
 join_times = {}  # chat_id -> [timestamps]
 raid_until = {}  # chat_id -> timestamp
@@ -1007,12 +1018,17 @@ def onoff_arg(message):
     return {"on": "1", "off": "0", "yes": "1", "no": "0"}.get(a)
 
 
-def has_link(message):
+def has_link(message, mentions=True):
+    """URL, t.me link, bare domain, hidden link ya (mentions=True par) @username."""
     text = message.text or message.caption or ""
-    if URL_RE.search(text):
+    if URL_RE.search(text) or DOMAIN_RE.search(text):
+        return True
+    if mentions and MENTION_RE.search(text):
         return True
     for ent in message.entities or message.caption_entities or []:
         if ent.type in (enums.MessageEntityType.URL, enums.MessageEntityType.TEXT_LINK):
+            return True
+        if mentions and ent.type == enums.MessageEntityType.MENTION:
             return True
     return False
 
@@ -1066,8 +1082,8 @@ async def automod(client, message):
             return await violation(client, message, f"<b>{name}</b> yahan allowed nahi hai", warn=False)
 
     # 2) Anti-link -> delete + warn
-    if cfg(cid, "antilink") == "1" and has_link(message):
-        return await violation(client, message, "links allowed nahi hain")
+    if cfg(cid, "antilink") == "1" and has_link(message, cfg(cid, "link_mentions") == "1"):
+        return await violation(client, message, "links aur @username allowed nahi hain")
 
     # 3) Blacklist words -> delete + warn
     text = (message.text or message.caption or "").lower()
@@ -1075,6 +1091,17 @@ async def automod(client, message):
         for (w,) in db.execute("SELECT word FROM blacklist WHERE chat_id=?", (cid,)).fetchall():
             if w in text:
                 return await violation(client, message, "blacklisted word use kiya")
+
+    # 3b) Anti-repeat -> same text 3 times in 60s: delete + warn
+    if cfg(cid, "antirepeat") == "1" and len(text) >= 4:
+        now_t = time.time()
+        rkey = (cid, u.id)
+        hist = [(t, x) for t, x in repeat_hist.get(rkey, []) if now_t - t < 60]
+        hist.append((now_t, text))
+        repeat_hist[rkey] = hist
+        if sum(1 for _, x in hist if x == text) >= 3:
+            repeat_hist[rkey] = []
+            return await violation(client, message, "same message baar-baar bhejna allowed nahi hai")
 
     # 4) Anti-flood -> mute 5 minutes
     limit = int(cfg(cid, "flood_limit"))
@@ -1227,6 +1254,16 @@ async def antilink_cmd(client, message):
         return await say(message, "Usage: /antilink on|off")
     setcfg(message.chat.id, "antilink", v)
     await say(message, f"🔗 Anti-link: <b>{'ON' if v == '1' else 'OFF'}</b>")
+
+
+@app.on_message(filters.command("antimention") & filters.group)
+@admin_only
+async def antimention_cmd(client, message):
+    v = onoff_arg(message)
+    if v is None:
+        return await say(message, "Usage: /antimention on|off\n(ON par Anti-link ke saath @username wale messages bhi delete + warn honge.)")
+    setcfg(message.chat.id, "link_mentions", v)
+    await say(message, f"@ Mention-link: <b>{'ON' if v == '1' else 'OFF'}</b>")
 
 
 @app.on_message(filters.command("antibot") & filters.group)
@@ -1586,7 +1623,7 @@ HELP_PAGES = {
     "auto": (
         f"🧹 <b>Automod</b>\n{LINE}\n"
         "🔒 /lock &lt;type&gt; • /unlock &lt;type|all&gt; • /locks\n"
-        "🔗 /antilink on|off • 🤖 /antibot on|off\n"
+        "🔗 /antilink on|off • @ /antimention on|off\n🤖 /antibot on|off\n"
         "🌊 /setflood &lt;n&gt; • 🚨 /antiraid &lt;n&gt;\n"
         "🚫 /addblacklist • /rmblacklist • /blacklist\n"
         "✅ /approve • /unapprove • /approved\n"
@@ -1701,7 +1738,10 @@ def panel_text(chat):
         f"👋 Welcome: {_yn(cid, 'welcome_on')}   🚪 Goodbye: {_yn(cid, 'goodbye_on')}\n"
         f"🛡 Verify: <b>{cfg(cid, 'verify')}</b>   🧹 Service clean: {_yn(cid, 'clean_service')}\n"
         f"🔗 Anti-link: {_yn(cid, 'antilink')}   🤖 Anti-bot: {_yn(cid, 'antibot')}\n"
+        f"@ Mention = link: {_yn(cid, 'link_mentions')}\n"
         f"🌊 Flood: <b>{'off' if fl == '0' else fl + ' msg/10s'}</b>   🚨 Raid: <b>{'off' if rl == '0' else rl + ' join/30s'}</b>\n"
+        f"🔁 Anti-repeat: {_yn(cid, 'antirepeat')}   🏆 Levels: {_yn(cid, 'levels')}\n"
+        f"🌙 Night mode: <b>{night_label(cid)}</b>\n"
         f"⚖️ Warns: <b>{cfg(cid, 'warn_limit')}</b> → <b>{cfg(cid, 'warn_action')}</b>\n"
         f"⏱ Auto-delete: <b>{'off' if ad == '0' else ad + 's'}</b>\n"
         f"📢 Force sub: <b>{'on' if cfg(cid, 'forcesub') else 'off'}</b>   📝 Log: <b>{'on' if cfg(cid, 'logchan') else 'off'}</b>\n"
@@ -1732,10 +1772,16 @@ def panel(cid):
                 Btn(f"🔗 Anti-link {onoff('antilink')}", callback_data="set:antilink"),
                 Btn(f"🤖 Anti-bot {onoff('antibot')}", callback_data="set:antibot"),
             ],
+            [Btn(f"@ Mention = link {onoff('link_mentions')}", callback_data="set:link_mentions")],
             [
                 Btn(f"🌊 Flood: {'off' if fl == '0' else fl}", callback_data="set:flood"),
                 Btn(f"🚨 Raid: {'off' if rl == '0' else rl}", callback_data="set:raid"),
             ],
+            [
+                Btn(f"🔁 Repeat {onoff('antirepeat')}", callback_data="set:antirepeat"),
+                Btn(f"🏆 Levels {onoff('levels')}", callback_data="set:levels"),
+            ],
+            [Btn(f"🌙 Night mode: {'ON' if cfg(cid, 'night_on') == '1' else 'OFF'}", callback_data="set:night")],
             [
                 Btn(f"⚖️ Action: {cfg(cid, 'warn_action')}", callback_data="set:warn_action"),
                 Btn(f"⏱ Del: {'off' if ad == '0' else ad + 's'}", callback_data="set:autodelete"),
@@ -1808,8 +1854,13 @@ async def settings_cb(client, cb):
         await ui_edit(cb, locks_text(), locks_kb(cid))
         return await cb.answer()
 
-    if key in ("welcome_on", "goodbye_on", "clean_service", "antilink", "antibot"):
+    if key in ("welcome_on", "goodbye_on", "clean_service", "antilink", "antibot", "link_mentions", "antirepeat", "levels"):
         setcfg(cid, key, "0" if cfg(cid, key) == "1" else "1")
+    elif key == "night":
+        new = "0" if cfg(cid, "night_on") == "1" else "1"
+        setcfg(cid, "night_on", new)
+        if new == "0" and cfg(cid, "night_state") == "1":
+            await night_unlock(client, cid)
     elif key == "flood":
         cur = cfg(cid, "flood_limit")
         cur = cur if cur in FLOOD_CYCLE else "0"
@@ -2111,6 +2162,443 @@ async def keyword_filter_handler(client, message):
 
 
 # --------------------------------------------------------------------------- #
+# ADVANCED v2: Levels/XP, Night mode, Timezone, Scheduled messages,
+# Temp-ban, Anti-repeat, Lockdown, background scheduler
+# --------------------------------------------------------------------------- #
+from datetime import timezone  # noqa: E402
+from pyrogram import idle  # noqa: E402
+
+db.executescript(
+    """
+CREATE TABLE IF NOT EXISTS schedules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER, text TEXT, run_at INTEGER, repeat INTEGER DEFAULT 0
+);
+"""
+)
+db.commit()
+
+repeat_hist = {}  # (chat_id, user_id) -> [(ts, text)]
+
+# ----- help pages extended -------------------------------------------------- #
+HELP_PAGES["auto"] += "\n🔁 /antirepeat on|off – same message baar-baar bhejna block"
+HELP_PAGES["tools"] += (
+    "\n\n⏳ /tban &lt;10m|2h|1d&gt; – temporary ban\n"
+    "🚧 /lockdown on|off – poora group lock/unlock\n"
+    "🌙 /nightmode on|off|&lt;start&gt; &lt;end&gt; – raat ko auto lock\n"
+    "🕒 /timezone +5:30 – group ka time zone\n"
+    "⏰ /schedule &lt;time&gt; &lt;text&gt; • /repeat &lt;time&gt; &lt;text&gt;\n"
+    "📋 /schedules • /unschedule &lt;id&gt;"
+)
+HELP_PAGES["manage"] += "\n\n🏆 /rank • /top • /levels on|off"
+INFO_PAGES["features"] += (
+    "\n🏆 Levels / XP &amp; leaderboard\n🌙 Night mode &amp; Lockdown\n⏰ Scheduled &amp; repeating messages\n🔁 Anti-repeat • ⏳ Temp-ban"
+)
+HELP = HELP.replace(
+    "\n\n👨‍💻 Created by @roaroic0",
+    "\n\n<b>Advanced</b>\n"
+    "/tban · /lockdown · /nightmode · /timezone\n"
+    "/schedule · /repeat · /schedules · /unschedule\n"
+    "/antirepeat on|off · /rank · /top · /levels on|off"
+    "\n\n👨‍💻 Created by @roaroic0",
+)
+
+
+# ----- Helpers -------------------------------------------------------------- #
+def full_perms():
+    try:
+        return ChatPermissions(
+            can_send_messages=True, can_send_media_messages=True,
+            can_send_other_messages=True, can_send_polls=True,
+            can_add_web_page_previews=True, can_invite_users=True,
+        )
+    except TypeError:
+        return ChatPermissions(can_send_messages=True)
+
+
+def parse_tz(s):
+    m = re.fullmatch(r"([+-])(\d{1,2})(?::?(\d{2}))?", s.strip())
+    if not m:
+        return None
+    h, mi = int(m.group(2)), int(m.group(3) or 0)
+    if h > 14 or mi not in (0, 15, 30, 45):
+        return None
+    return f"{m.group(1)}{h:02d}:{mi:02d}"
+
+
+def tz_delta(s):
+    sign = -1 if s[0] == "-" else 1
+    h, m = s[1:].split(":")
+    return sign * timedelta(hours=int(h), minutes=int(m))
+
+
+def parse_hm(s):
+    m = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", s.strip())
+    if not m:
+        return None
+    return f"{int(m.group(1)):02d}:{m.group(2)}"
+
+
+def hm_to_min(s):
+    h, m = s.split(":")
+    return int(h) * 60 + int(m)
+
+
+def local_now(chat_id):
+    return datetime.now(timezone.utc) + tz_delta(cfg(chat_id, "tz"))
+
+
+def night_label(chat_id):
+    if cfg(chat_id, "night_on") != "1":
+        return "off"
+    return f"{cfg(chat_id, 'night_start')}–{cfg(chat_id, 'night_end')} (UTC{cfg(chat_id, 'tz')})"
+
+
+def is_night_now(chat_id):
+    s, e = hm_to_min(cfg(chat_id, "night_start")), hm_to_min(cfg(chat_id, "night_end"))
+    if s == e:
+        return False
+    now = local_now(chat_id)
+    nowm = now.hour * 60 + now.minute
+    return (s <= nowm < e) if s < e else (nowm >= s or nowm < e)
+
+
+async def night_lock(client, cid):
+    try:
+        await client.set_chat_permissions(cid, ChatPermissions())
+    except RPCError:
+        return False
+    setcfg(cid, "night_state", "1")
+    try:
+        m = await client.send_message(
+            cid, f"🌙 <b>Night mode ON</b>\nGroup {cfg(cid, 'night_end')} tak band hai. Shubh ratri! 😴"
+        )
+        autodel(cid, m, 600)
+    except RPCError:
+        pass
+    return True
+
+
+async def night_unlock(client, cid):
+    try:
+        await client.set_chat_permissions(cid, full_perms())
+    except RPCError:
+        return False
+    setcfg(cid, "night_state", "0")
+    try:
+        m = await client.send_message(cid, "☀️ <b>Night mode OFF</b>\nGroup khul gaya. Good morning! 🌅")
+        autodel(cid, m, 600)
+    except RPCError:
+        pass
+    return True
+
+
+# ----- Background scheduler ------------------------------------------------- #
+async def _run_schedules(client):
+    now = int(time.time())
+    rows = db.execute(
+        "SELECT id, chat_id, text, repeat FROM schedules WHERE run_at<=?", (now,)
+    ).fetchall()
+    for sid, cid, text, rep in rows:
+        try:
+            try:
+                await client.send_message(cid, text)
+            except RPCError as e:
+                if any(k in str(e).upper() for k in ("ENTITY", "PARSE", "TAG")):
+                    await client.send_message(cid, text, parse_mode=enums.ParseMode.DISABLED)
+        except Exception:
+            pass
+        if rep:
+            nxt = now + rep
+            db.execute("UPDATE schedules SET run_at=? WHERE id=?", (nxt, sid))
+        else:
+            db.execute("DELETE FROM schedules WHERE id=?", (sid,))
+    if rows:
+        db.commit()
+
+
+async def _run_night(client):
+    chats = [r[0] for r in db.execute("SELECT chat_id FROM settings WHERE key='night_on' AND value='1'")]
+    for cid in chats:
+        state = cfg(cid, "night_state") == "1"
+        night = is_night_now(cid)
+        if night and not state:
+            await night_lock(client, cid)
+        elif not night and state:
+            await night_unlock(client, cid)
+
+
+async def scheduler_loop(client):
+    await asyncio.sleep(5)
+    while True:
+        try:
+            await _run_schedules(client)
+            await _run_night(client)
+        except Exception as e:  # never let the loop die
+            print("scheduler error:", e)
+        await asyncio.sleep(30)
+
+
+async def _main():
+    await app.start()
+    t = asyncio.create_task(scheduler_loop(app))
+    _tasks.add(t)
+    print("Bot started ✅")
+    await idle()
+    await app.stop()
+
+
+# ----- Temp ban ------------------------------------------------------------- #
+@app.on_message(filters.command("tban") & filters.group)
+@admin_only
+async def tban_cmd(client, message):
+    r = await prep(client, message)
+    if not r:
+        return
+    user, rest = r
+    delta = parse_time(rest[0]) if rest else None
+    if not delta:
+        return await say(message, "Usage: /tban &lt;10m|2h|1d|1w&gt; [reason] (reply ya ID/@username ke saath)")
+    reason = f"\nKaran: {html.escape(' '.join(rest[1:]))}" if len(rest) > 1 else ""
+    try:
+        await client.ban_chat_member(message.chat.id, user.id, until_date=datetime.now() + delta)
+    except RPCError as e:
+        return await say(message, f"❌ Ban fail: <code>{err(e)}</code>")
+    await log_action(client, message.chat, f"⏳ <b>Temp-ban</b> ({rest[0]})\nUser: {mention(user)} (<code>{user.id}</code>)\nBy: {actor(message)}{reason}")
+    await say(message, f"⏳ {mention(user)} ko <b>{rest[0]}</b> ke liye ban kar diya gaya.{reason}")
+
+
+# ----- Lockdown / Night mode / Timezone ------------------------------------- #
+@app.on_message(filters.command("lockdown") & filters.group)
+@admin_only
+async def lockdown_cmd(client, message):
+    v = onoff_arg(message)
+    if v is None:
+        return await say(message, "Usage: /lockdown on|off\nON: koi bhi member message nahi bhej sakta (sirf admins).")
+    try:
+        await client.set_chat_permissions(message.chat.id, ChatPermissions() if v == "1" else full_perms())
+    except RPCError as e:
+        return await say(message, f"❌ <code>{err(e)}</code>")
+    await log_action(client, message.chat, f"🚧 <b>Lockdown {'ON' if v == '1' else 'OFF'}</b> by {actor(message)}")
+    await say(message, "🚧 <b>Lockdown ON</b> – group lock ho gaya." if v == "1" else "✅ <b>Lockdown OFF</b> – group khul gaya.")
+
+
+@app.on_message(filters.command("timezone") & filters.group)
+@admin_only
+async def timezone_cmd(client, message):
+    cid = message.chat.id
+    if len(message.command) < 2:
+        now = local_now(cid)
+        return await say(message, f"🕒 Time zone: <b>UTC{cfg(cid, 'tz')}</b>\nAbhi: {now.strftime('%H:%M')}\nBadalne ke liye: /timezone +5:30")
+    tz = parse_tz(message.command[1])
+    if not tz:
+        return await say(message, "⚠️ Format: /timezone +5:30 (ya -4:00, +0)")
+    setcfg(cid, "tz", tz)
+    await say(message, f"🕒 Time zone set: <b>UTC{tz}</b> (abhi {local_now(cid).strftime('%H:%M')})")
+
+
+@app.on_message(filters.command("nightmode") & filters.group)
+@admin_only
+async def nightmode_cmd(client, message):
+    cid = message.chat.id
+    args = message.command[1:]
+    if not args:
+        return await say(
+            message,
+            f"🌙 <b>Night mode:</b> {night_label(cid)}\n\n"
+            "/nightmode on|off\n/nightmode 23:00 06:00 (start end, local time)\n/timezone +5:30 se time zone set karein.\n"
+            "<i>Bot ko 'Restrict members' / 'Change group info' admin right chahiye.</i>",
+        )
+    if len(args) == 2:
+        a, b = parse_hm(args[0]), parse_hm(args[1])
+        if not a or not b or a == b:
+            return await say(message, "⚠️ Format: /nightmode 23:00 06:00")
+        setcfg(cid, "night_start", a)
+        setcfg(cid, "night_end", b)
+        setcfg(cid, "night_on", "1")
+        return await say(message, f"🌙 Night mode ON: <b>{a} – {b}</b> (UTC{cfg(cid, 'tz')})")
+    v = onoff_arg(message)
+    if v is None:
+        return await say(message, "Usage: /nightmode on|off ya /nightmode 23:00 06:00")
+    setcfg(cid, "night_on", v)
+    if v == "0" and cfg(cid, "night_state") == "1":
+        await night_unlock(client, cid)
+    await say(message, f"🌙 Night mode: <b>{'ON' if v == '1' else 'OFF'}</b>")
+
+
+# ----- Anti-repeat / Levels toggles ----------------------------------------- #
+@app.on_message(filters.command("antirepeat") & filters.group)
+@admin_only
+async def antirepeat_cmd(client, message):
+    v = onoff_arg(message)
+    if v is None:
+        return await say(message, "Usage: /antirepeat on|off\n60 second me same message 3 baar bheja to delete + warn.")
+    setcfg(message.chat.id, "antirepeat", v)
+    await say(message, f"🔁 Anti-repeat: <b>{'ON' if v == '1' else 'OFF'}</b>")
+
+
+@app.on_message(filters.command("levels") & filters.group)
+@admin_only
+async def levels_cmd(client, message):
+    v = onoff_arg(message)
+    if v is None:
+        return await say(message, "Usage: /levels on|off (level-up messages)")
+    setcfg(message.chat.id, "levels", v)
+    await say(message, f"🏆 Level-up messages: <b>{'ON' if v == '1' else 'OFF'}</b>")
+
+
+# ----- Scheduled messages --------------------------------------------------- #
+def _fmt_delta(sec):
+    for unit, n in (("din", 86400), ("ghante", 3600), ("minute", 60)):
+        if sec >= n:
+            return f"{sec // n} {unit}"
+    return f"{sec} second"
+
+
+async def _add_schedule(client, message, repeating):
+    cid = message.chat.id
+    parts = message.text.split(None, 2)
+    cmd = "repeat" if repeating else "schedule"
+    delta = parse_time(parts[1]) if len(parts) > 1 else None
+    text = parts[2].strip() if len(parts) > 2 else None
+    if not text and message.reply_to_message:
+        text = message.reply_to_message.text or message.reply_to_message.caption
+    if not delta or not text:
+        return await say(message, f"Usage: /{cmd} &lt;10m|2h|1d&gt; &lt;text&gt;\nExample: /{cmd} 6h Rules padh lein 📜")
+    secs = int(delta.total_seconds())
+    if secs < 60 or (repeating and secs < 300):
+        return await say(message, "⚠️ Minimum: schedule 1 minute, repeat 5 minute.")
+    if len(text) > 1000:
+        return await say(message, "⚠️ Text bahut lamba hai (max 1000).")
+    count = db.execute("SELECT COUNT(*) FROM schedules WHERE chat_id=?", (cid,)).fetchone()[0]
+    if count >= 10:
+        return await say(message, "⚠️ Ek group me max 10 schedules. /schedules dekhein, /unschedule se hatayein.")
+    cur = db.execute(
+        "INSERT INTO schedules(chat_id, text, run_at, repeat) VALUES (?,?,?,?)",
+        (cid, text, int(time.time()) + secs, secs if repeating else 0),
+    )
+    db.commit()
+    kind = f"🔁 Har {_fmt_delta(secs)} me" if repeating else f"⏰ {_fmt_delta(secs)} baad"
+    await say(message, f"{kind} bhejunga.\nID: <code>{cur.lastrowid}</code> (hatane ke liye /unschedule {cur.lastrowid})")
+
+
+@app.on_message(filters.command("schedule") & filters.group)
+@admin_only
+async def schedule_cmd(client, message):
+    await _add_schedule(client, message, False)
+
+
+@app.on_message(filters.command("repeat") & filters.group)
+@admin_only
+async def repeat_cmd(client, message):
+    await _add_schedule(client, message, True)
+
+
+@app.on_message(filters.command("schedules") & filters.group)
+@admin_only
+async def schedules_cmd(client, message):
+    cid = message.chat.id
+    rows = db.execute(
+        "SELECT id, text, run_at, repeat FROM schedules WHERE chat_id=? ORDER BY run_at", (cid,)
+    ).fetchall()
+    if not rows:
+        return await say(message, "⏰ Koi schedule nahi hai.")
+    lines = []
+    for sid, text, run_at, rep in rows:
+        when = (datetime.fromtimestamp(run_at, timezone.utc) + tz_delta(cfg(cid, "tz"))).strftime("%d %b %H:%M")
+        tag = f"🔁 {_fmt_delta(rep)}" if rep else "⏰ once"
+        preview = html.escape(text[:40] + ("…" if len(text) > 40 else ""))
+        lines.append(f"<code>{sid}</code> • {tag} • {when}\n   {preview}")
+    await say(message, "⏰ <b>Schedules</b>\n" + "\n".join(lines))
+
+
+@app.on_message(filters.command("unschedule") & filters.group)
+@admin_only
+async def unschedule_cmd(client, message):
+    if len(message.command) < 2 or not message.command[1].isdigit():
+        return await say(message, "Usage: /unschedule &lt;id&gt; (ID /schedules me dikhti hai)")
+    cur = db.execute("DELETE FROM schedules WHERE id=? AND chat_id=?", (int(message.command[1]), message.chat.id))
+    db.commit()
+    await say(message, "🗑 Schedule hata diya." if cur.rowcount else "Ye ID is group me nahi mili.")
+
+
+# ----- Levels / XP ---------------------------------------------------------- #
+LEVEL_TITLES = ["🌱 Newbie", "🙂 Member", "⭐ Active", "🔥 Pro", "💎 Elite", "👑 Legend"]
+
+
+def level_of(msgs):
+    return int((msgs / 10) ** 0.5)
+
+
+def level_title(level):
+    return LEVEL_TITLES[min(level // 2, len(LEVEL_TITLES) - 1)]
+
+
+def bar(frac):
+    n = max(0, min(10, int(frac * 10)))
+    return "▰" * n + "▱" * (10 - n)
+
+
+@app.on_message(filters.command("rank") & filters.group)
+async def rank_cmd(client, message):
+    cid = message.chat.id
+    user, _ = await get_target(client, message)
+    user = user or message.from_user
+    if not user:
+        return
+    row = db.execute("SELECT messages FROM users WHERE chat_id=? AND user_id=?", (cid, user.id)).fetchone()
+    msgs = row[0] if row else 0
+    lvl = level_of(msgs)
+    cur_xp, nxt_xp = lvl ** 2 * 10, (lvl + 1) ** 2 * 10
+    frac = (msgs - cur_xp) / (nxt_xp - cur_xp)
+    pos = db.execute("SELECT COUNT(*) FROM users WHERE chat_id=? AND messages>?", (cid, msgs)).fetchone()[0] + 1
+    await say(
+        message,
+        f"🏅 <b>Rank Card</b>\n{LINE}\n"
+        f"👤 {mention(user)}\n"
+        f"{level_title(lvl)} • Level <b>{lvl}</b>\n"
+        f"{bar(frac)} {msgs}/{nxt_xp}\n"
+        f"💬 Messages: <b>{msgs}</b>\n"
+        f"🏆 Group rank: <b>#{pos}</b>",
+    )
+
+
+@app.on_message(filters.command("top") & filters.group)
+async def top_cmd(client, message):
+    rows = db.execute(
+        "SELECT user_id, name, messages FROM users WHERE chat_id=? ORDER BY messages DESC LIMIT 10",
+        (message.chat.id,),
+    ).fetchall()
+    if not rows:
+        return await say(message, "Abhi koi data nahi hai.")
+    medals = ["🥇", "🥈", "🥉"] + [f"{i}." for i in range(4, 11)]
+    lines = [
+        f"{medals[i]} {html.escape(n or 'User')} — L{level_of(m)} • {m} msgs"
+        for i, (_, n, m) in enumerate(rows)
+    ]
+    await say(message, f"🏆 <b>Leaderboard</b>\n{LINE}\n" + "\n".join(lines))
+
+
+@app.on_message(filters.group & ~filters.service, group=8)
+async def level_up_handler(client, message):
+    u = message.from_user
+    if not u or u.is_bot:
+        return
+    cid = message.chat.id
+    if cfg(cid, "levels") != "1":
+        return
+    row = db.execute("SELECT messages FROM users WHERE chat_id=? AND user_id=?", (cid, u.id)).fetchone()
+    if not row or row[0] < 10:
+        return
+    now, before = level_of(row[0]), level_of(row[0] - 1)
+    if now > before:
+        m = await client.send_message(
+            cid, f"🎉 {mention(u)} ab <b>Level {now}</b> par pahunch gaya! {level_title(now)}"
+        )
+        autodel(cid, m, 30)
+
+
+# --------------------------------------------------------------------------- #
 # Keep-alive web server (Render/Koyeb/Heroku jaise Web Service hosts ke liye)
 # Sirf tab chalta hai jab PORT environment variable set ho.
 # --------------------------------------------------------------------------- #
@@ -2149,4 +2637,4 @@ def start_keepalive():
 if __name__ == "__main__":
     print(f"Group Manager Bot v{__version__} (created by @roaroic0) starting...")
     start_keepalive()
-    app.run()
+    app.run(_main())
