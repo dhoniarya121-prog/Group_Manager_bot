@@ -12,6 +12,29 @@ Ek all-in-one group moderation bot (Python + Pyrogram + SQLite).
 3. **Admin Control Panel** – `/purge`, `/id`, `/info`, inline `/settings` panel
 4. **Group Management** – member stats, auto-delete, custom rules aur commands, admin-only controls
 
+## 🎨 Button Interface (v1.0)
+
+- `/start` – sundar welcome menu: Add to Group, Commands, Features, Setup Guide, Developer Channel (owner ko 👑 Owner Panel bhi)
+- `/help` – category buttons: Moderation, Welcome, Automod, Tools, Management, Full list
+- `/settings` – live dashboard: har button dabane par status text turant update hota hai (Welcome, Goodbye, Verify, Anti-link, Anti-bot, Flood, Raid, Warn action/limit, Auto-delete, Locks page, Stats, Rules, Help)
+- 🔒 **Locks page** – har media type ka lock/unlock button
+
+## 👑 Bot Owner Tools
+
+`.env` me `OWNER_IDS=123456789` (comma se alag kar ke kai IDs) set karein.
+
+| Command | Kaam |
+|---|---|
+| `/panel` | Owner panel: bot users, groups, groups list, broadcast guide |
+| `/stats` (private me) | Global stats (users + groups) |
+| `/broadcast` | Kisi message par reply karke likhein, phir Users / Groups / All button chuniye |
+
+Dead users/groups (jinhone bot block kiya ya bot hata diya) broadcast ke dauran automatically list se hat jate hain.
+
+## 🔎 Keyword Filters
+
+`/filter hello | Namaste!` – jab koi message me "hello" likhe to bot reply karta hai. `/filters` se list, `/stopfilter hello` se hatayein.
+
 ## 🚀 Setup
 
 1. Python 3.9+ install karein.
@@ -24,7 +47,9 @@ Ek all-in-one group moderation bot (Python + Pyrogram + SQLite).
    API_ID=12345
    API_HASH=your_api_hash
    BOT_TOKEN=123456:your_bot_token
+   OWNER_IDS=123456789
    ```
+   `OWNER_IDS` aapki numeric Telegram ID hai (@userinfobot se pata chalti hai).
    - `API_ID` aur `API_HASH`: https://my.telegram.org se
    - `BOT_TOKEN`: @BotFather se
 4. Bot chalayein:
@@ -146,7 +171,8 @@ Bot ko 24x7 chalane ke liye VPS ya hosting par `python group_manager_bot.py` cha
 
 - **Build Command:** `pip install -r requirements.txt`
 - **Start Command:** `python group_manager_bot.py`
-- **Environment:** `API_ID`, `API_HASH`, `BOT_TOKEN`, `PYTHON_VERSION=3.11.9`
+- **Environment:** `API_ID`, `API_HASH`, `BOT_TOKEN`, `OWNER_IDS`, `PYTHON_VERSION=3.11.9`
+- Repo me `render.yaml` bhi hai (Blueprint deploy ke liye)
 - **Web Service** par chalane par bot khud ek chhota keep-alive server `PORT` par chalata hai, isliye "No open ports detected" error nahi aata.
 - Free Web Service 15 minute idle rehne par so jati hai. [UptimeRobot](https://uptimerobot.com) me apne Render URL ka HTTP monitor 5 minute interval par lagayein.
 - Render ka disk restart par khali ho jata hai, isliye `group_manager.db` (settings/warns) reset ho sakta hai. Permanent data ke liye Persistent Disk ya external database lagayein.
@@ -164,5 +190,7 @@ Bot ko 24x7 chalane ke liye VPS ya hosting par `python group_manager_bot.py` cha
 
 - `group_manager_bot.py` – poora bot
 - `requirements.txt` – dependencies
-- `env.example.txt` – `.env` ka template
+- `env.example.txt` / `.env.example` – `.env` ka template
+- `render.yaml` – Render Blueprint
+- `.gitignore` – `.env` aur database ko GitHub se bachata hai
 - `README.md` – ye file

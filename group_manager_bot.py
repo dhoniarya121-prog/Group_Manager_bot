@@ -33,6 +33,10 @@ load_dotenv()
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 BOT_TOKEN = os.environ["BOT_TOKEN"]
+OWNER_IDS = {
+    int(x) for x in os.environ.get("OWNER_IDS", "").replace(" ", "").split(",")
+    if x.lstrip("-").isdigit()
+}
 
 app = Client(
     "group_manager",
@@ -127,7 +131,7 @@ RESERVED = {
     "approve", "unapprove", "approved", "lock", "unlock", "locks", "antilink",
     "antibot", "setflood", "antiraid", "addblacklist", "rmblacklist", "blacklist",
     "setlog", "report", "admins", "slowmode", "pin", "unpin", "unpinall",
-    "promote", "demote",
+    "promote", "demote", "panel", "broadcast", "filter", "filters", "stopfilter",
 }
 
 _tasks = set()
@@ -337,22 +341,15 @@ Placeholders: {first} {mention} {id} {username} {chat} {count}
 /slowmode &lt;sec|off&gt; · /promote · /demote (owner)
 /setlog &lt;channel_id&gt; | off
 
+<b>Keyword filters</b>
+/filter word | reply · /filters · /stopfilter word
+
+<b>Bot owner</b>
+/panel · /broadcast · /stats (private)
+
 Bot ko group me <b>admin</b> banayein (delete, restrict, ban, invite permissions ke saath).
 
 👨‍💻 Created by @roaroic0"""
-
-
-@app.on_message(filters.command(["start", "help"]))
-async def start_cmd(client, message):
-    me = await client.get_me()
-    rows = []
-    add_url = (
-        f"https://t.me/{me.username}?startgroup=true"
-        "&admin=delete_messages+restrict_members+invite_users+pin_messages+promote_members+manage_chat"
-    )
-    rows.append([Btn("➕ Apne Group me add karein", url=add_url)])
-    rows.append([Btn("📢 Developer Channel", url="https://t.me/roaroic0")])
-    await message.reply_text(HELP, reply_markup=Kb(rows))
 
 
 # --------------------------------------------------------------------------- #
@@ -568,82 +565,6 @@ VERIFY_CYCLE = ["off", "button", "captcha"]
 ACTION_CYCLE = ["mute", "kick", "ban"]
 
 
-def panel(cid):
-    def onoff(k):
-        return "✅" if cfg(cid, k) == "1" else "❌"
-
-    ad = cfg(cid, "autodelete")
-    fs = cfg(cid, "forcesub") or "off"
-    return Kb(
-        [
-            [
-                Btn(f"👋 Welcome {onoff('welcome_on')}", callback_data="set:welcome_on"),
-                Btn(f"🚪 Goodbye {onoff('goodbye_on')}", callback_data="set:goodbye_on"),
-            ],
-            [
-                Btn(f"🛡 Verify: {cfg(cid, 'verify')}", callback_data="set:verify"),
-                Btn(f"🧹 Service clean {onoff('clean_service')}", callback_data="set:clean_service"),
-            ],
-            [
-                Btn(f"⚖️ Warn action: {cfg(cid, 'warn_action')}", callback_data="set:warn_action"),
-                Btn(f"⏱ Auto-delete: {ad + 's' if ad != '0' else 'off'}", callback_data="set:autodelete"),
-            ],
-            [
-                Btn("➖", callback_data="set:warn_dn"),
-                Btn(f"Warn limit: {cfg(cid, 'warn_limit')}", callback_data="set:noop"),
-                Btn("➕", callback_data="set:warn_up"),
-            ],
-            [
-                Btn(f"🔗 Anti-link {onoff('antilink')}", callback_data="set:antilink"),
-                Btn(f"🤖 Anti-bot {onoff('antibot')}", callback_data="set:antibot"),
-            ],
-            [Btn(f"🌊 Anti-flood: {'off' if cfg(cid, 'flood_limit') == '0' else cfg(cid, 'flood_limit') + ' msg/10s'}", callback_data="set:flood")],
-            [Btn(f"📢 Force sub: {fs}", callback_data="set:noop")],
-            [Btn("✖️ Close", callback_data="set:close")],
-        ]
-    )
-
-
-@app.on_message(filters.command("settings") & filters.group)
-@admin_only
-async def settings_cmd(client, message):
-    await message.reply_text("⚙️ <b>Group Settings</b>", reply_markup=panel(message.chat.id))
-
-
-@app.on_callback_query(filters.regex(r"^set:"))
-async def settings_cb(client, cb):
-    cid = cb.message.chat.id
-    if not await is_admin(client, cid, cb.from_user.id):
-        return await cb.answer("Sirf admins!", show_alert=True)
-    key = cb.data.split(":", 1)[1]
-    if key == "close":
-        return await cb.message.delete()
-    if key in ("welcome_on", "goodbye_on", "clean_service", "antilink", "antibot"):
-        setcfg(cid, key, "0" if cfg(cid, key) == "1" else "1")
-    elif key == "flood":
-        cur = cfg(cid, "flood_limit")
-        cur = cur if cur in FLOOD_CYCLE else "0"
-        setcfg(cid, "flood_limit", FLOOD_CYCLE[(FLOOD_CYCLE.index(cur) + 1) % len(FLOOD_CYCLE)])
-    elif key == "verify":
-        cur = cfg(cid, "verify")
-        setcfg(cid, "verify", VERIFY_CYCLE[(VERIFY_CYCLE.index(cur) + 1) % 3])
-    elif key == "warn_action":
-        cur = cfg(cid, "warn_action")
-        setcfg(cid, "warn_action", ACTION_CYCLE[(ACTION_CYCLE.index(cur) + 1) % 3])
-    elif key == "autodelete":
-        cur = cfg(cid, "autodelete")
-        cur = cur if cur in AD_CYCLE else "0"
-        setcfg(cid, "autodelete", AD_CYCLE[(AD_CYCLE.index(cur) + 1) % len(AD_CYCLE)])
-    elif key in ("warn_up", "warn_dn"):
-        n = int(cfg(cid, "warn_limit")) + (1 if key == "warn_up" else -1)
-        setcfg(cid, "warn_limit", min(10, max(1, n)))
-    try:
-        await cb.message.edit_reply_markup(panel(cid))
-    except RPCError:
-        pass
-    await cb.answer()
-
-
 @app.on_message(filters.command("setwelcome") & filters.group)
 @admin_only
 async def setwelcome_cmd(client, message):
@@ -807,41 +728,13 @@ async def custom_cmd_handler(client, message):
 # --------------------------------------------------------------------------- #
 # Stats
 # --------------------------------------------------------------------------- #
-@app.on_message(filters.command("stats") & filters.group)
-async def stats_cmd(client, message):
-    cid = message.chat.id
-    try:
-        members = await client.get_chat_members_count(cid)
-    except RPCError:
-        members = "?"
-    day = time.strftime("%Y-%m-%d")
-    row = db.execute("SELECT joins, leaves, messages FROM stats WHERE chat_id=? AND day=?", (cid, day)).fetchone() or (0, 0, 0)
-    week = db.execute(
-        "SELECT SUM(joins), SUM(leaves), SUM(messages) FROM stats WHERE chat_id=? AND day>=?",
-        (cid, time.strftime("%Y-%m-%d", time.localtime(time.time() - 6 * 86400))),
-    ).fetchone()
-    top = db.execute(
-        "SELECT name, messages FROM users WHERE chat_id=? ORDER BY messages DESC LIMIT 5", (cid,)
-    ).fetchall()
-    text = (
-        f"📊 <b>Group Stats</b>\n"
-        f"👥 Total members: {members}\n\n"
-        f"<b>Aaj</b>: +{row[0]} joins · -{row[1]} leaves · {row[2]} messages\n"
-        f"<b>7 din</b>: +{week[0] or 0} joins · -{week[1] or 0} leaves · {week[2] or 0} messages\n"
-    )
-    if top:
-        text += "\n🏆 <b>Top active</b>\n" + "\n".join(
-            f"{i}. {html.escape(n or 'User')} — {m}" for i, (n, m) in enumerate(top, 1)
-        )
-    await say(message, text)
-
-
 @app.on_message(filters.group & ~filters.service, group=4)
 async def count_messages(client, message):
     u = message.from_user
     if not u or u.is_bot:
         return
     bump(message.chat.id, "messages")
+    track_chat(message.chat)
     db.execute("INSERT OR IGNORE INTO users(chat_id, user_id, name) VALUES (?,?,?)", (message.chat.id, u.id, u.first_name))
     db.execute(
         "UPDATE users SET messages=messages+1, name=? WHERE chat_id=? AND user_id=?",
@@ -915,6 +808,7 @@ async def on_join(client, message):
             else:
                 note = ("⚠️ Mujhe <b>admin</b> banayein (Delete messages, Restrict/Ban users, Invite users) "
                         "tabhi main kaam karunga. Phir /settings se setup karein.")
+            track_chat(chat)
             await message.reply_text(f"👋 Thanks for adding me!\n{note}")
             continue
         if (chat.id, u.id) in kicked_set:
@@ -1544,6 +1438,669 @@ async def demote_cmd(client, message):
     admin_cache.pop(message.chat.id, None)
     await say(message, f"⬇️ {mention(user)} ab admin nahi raha.")
     await log_action(client, message.chat, f"⬇️ <b>Demote</b>: {mention(user)} by {actor(message)}")
+
+
+# --------------------------------------------------------------------------- #
+# UI v2: beautiful start/help menus, settings dashboard, locks page,
+# owner panel, broadcast, global stats, keyword filters
+# --------------------------------------------------------------------------- #
+from pyrogram.errors import FloodWait  # noqa: E402
+
+DEV_URL = "https://t.me/roaroic0"
+LINE = "━━━━━━━━━━━━━━━━━━"
+RAID_CYCLE = ["0", "5", "10", "20"]
+
+db.executescript(
+    """
+CREATE TABLE IF NOT EXISTS bot_users (user_id INTEGER PRIMARY KEY, first_seen INTEGER);
+CREATE TABLE IF NOT EXISTS bot_chats (chat_id INTEGER PRIMARY KEY, title TEXT, type TEXT, first_seen INTEGER);
+CREATE TABLE IF NOT EXISTS kwfilters (chat_id INTEGER, keyword TEXT, reply TEXT, PRIMARY KEY (chat_id, keyword));
+"""
+)
+db.commit()
+
+seen_chats = set()
+seen_users = set()
+
+
+def is_owner(user_id):
+    return user_id in OWNER_IDS
+
+
+def track_chat(chat):
+    if chat.id in seen_chats:
+        return
+    seen_chats.add(chat.id)
+    db.execute(
+        "INSERT OR REPLACE INTO bot_chats(chat_id, title, type, first_seen) VALUES "
+        "(?,?,?,COALESCE((SELECT first_seen FROM bot_chats WHERE chat_id=?),?))",
+        (chat.id, chat.title or "", chat.type.name, chat.id, int(time.time())),
+    )
+    db.commit()
+
+
+def track_user(user_id):
+    if user_id in seen_users:
+        return
+    seen_users.add(user_id)
+    db.execute(
+        "INSERT OR IGNORE INTO bot_users(user_id, first_seen) VALUES (?,?)",
+        (user_id, int(time.time())),
+    )
+    db.commit()
+
+
+async def ui_edit(cb, text, kb=None):
+    try:
+        await cb.message.edit_text(text, reply_markup=kb)
+    except RPCError:
+        pass  # "message not modified" etc.
+
+
+def add_url_for(username):
+    return (
+        f"https://t.me/{username}?startgroup=true"
+        "&admin=delete_messages+restrict_members+invite_users+pin_messages+promote_members+manage_chat"
+    )
+
+
+# ----- Start / Help pages -------------------------------------------------- #
+async def start_content(client, user, private=True):
+    me = await client.get_me()
+    add_url = add_url_for(me.username)
+    name = mention(user) if user else "dost"
+    if private:
+        text = (
+            f"✨ <b>Group Manager Bot</b> ✨\n{LINE}\n"
+            f"Namaste {name}! 👋\n"
+            "Main aapke group ko <b>safe, clean aur organized</b> rakhne wala all-in-one manager hoon.\n\n"
+            "🛡 Moderation • 👋 Welcome &amp; CAPTCHA\n"
+            "🔗 Anti-link / Flood • 🚨 Anti-raid\n"
+            "📢 Force Subscribe • 🔒 Locks • 🧹 Automod\n"
+            "📊 Stats • ⚙️ Button Settings Panel\n\n"
+            "➕ Mujhe apne group me add karein aur <b>admin</b> banayein.\n"
+            f"{LINE}\n"
+            f"👨‍💻 Created by @roaroic0 • v{__version__}"
+        )
+        rows = [
+            [Btn("➕ Apne Group me add karein", url=add_url)],
+            [Btn("📚 Commands", callback_data="help:home"), Btn("✨ Features", callback_data="info:features")],
+            [Btn("🚀 Setup Guide", callback_data="info:setup"), Btn("📢 Developer Channel", url=DEV_URL)],
+        ]
+        if user and is_owner(user.id):
+            rows.append([Btn("👑 Owner Panel", callback_data="own:home")])
+    else:
+        text = (
+            f"✨ <b>Group Manager Bot</b> • v{__version__}\n{LINE}\n"
+            "Main active hoon! 🟢\n"
+            "⚙️ Settings: /settings   📚 Help: /help\n"
+            f"{LINE}\n👨‍💻 @roaroic0"
+        )
+        rows = [
+            [Btn("📚 Commands", callback_data="help:home"), Btn("➕ Add to group", url=add_url)],
+            [Btn("📢 Developer Channel", url=DEV_URL)],
+        ]
+    return text, Kb(rows)
+
+
+@app.on_message(filters.command("start"))
+async def start_cmd(client, message):
+    private = message.chat.type == enums.ChatType.PRIVATE
+    if private and message.from_user:
+        track_user(message.from_user.id)
+    text, kb = await start_content(client, message.from_user, private)
+    m = await message.reply_text(text, reply_markup=kb)
+    if not private:
+        autodel(message.chat.id, m, 120)
+
+
+HELP_PAGES = {
+    "mod": (
+        f"🛡 <b>Moderation</b>\n{LINE}\n"
+        "🔨 /ban – ban karein\n"
+        "♻️ /unban – ban hatayein\n"
+        "👢 /kick – group se nikalein\n"
+        "🔇 /mute [10m|2h|1d] – mute karein\n"
+        "🔊 /unmute – unmute karein\n"
+        "⚠️ /warn [reason] – warn dein\n"
+        "✅ /unwarn – ek warn hatayein\n"
+        "📋 /warns – warns dekhein\n"
+        "🧹 /purge – reply karke wahan se delete\n\n"
+        "<i>Reply karein ya ID/@username dein. Warn limit par auto action: /warnlimit, /warnaction</i>"
+    ),
+    "welcome": (
+        f"👋 <b>Welcome &amp; Verification</b>\n{LINE}\n"
+        "✏️ /setwelcome &lt;text&gt; • /setgoodbye &lt;text&gt;\n"
+        "🛡 /verify off|button|captcha\n"
+        "📢 /forcesub @channel [link] | off\n"
+        "📜 /setrules &lt;text&gt; • /rules\n\n"
+        "<b>Placeholders:</b> {first} {mention} {id} {username} {chat} {count}"
+    ),
+    "auto": (
+        f"🧹 <b>Automod</b>\n{LINE}\n"
+        "🔒 /lock &lt;type&gt; • /unlock &lt;type|all&gt; • /locks\n"
+        "🔗 /antilink on|off • 🤖 /antibot on|off\n"
+        "🌊 /setflood &lt;n&gt; • 🚨 /antiraid &lt;n&gt;\n"
+        "🚫 /addblacklist • /rmblacklist • /blacklist\n"
+        "✅ /approve • /unapprove • /approved\n"
+        "🔎 /filter word | reply • /filters • /stopfilter word"
+    ),
+    "tools": (
+        f"🧰 <b>Tools</b>\n{LINE}\n"
+        "🆔 /id • ℹ️ /info • 👮 /admins • 🚨 /report\n"
+        "📌 /pin [loud] • /unpin • /unpinall\n"
+        "🐢 /slowmode &lt;sec|off&gt;\n"
+        "⬆️ /promote • ⬇️ /demote (group owner)\n"
+        "📝 /setlog &lt;channel_id&gt; | off\n"
+        "💬 /addcmd • /delcmd • /cmds"
+    ),
+    "manage": (
+        f"📊 <b>Management</b>\n{LINE}\n"
+        "⚙️ /settings – button panel (sab kuch yahin se)\n"
+        "📊 /stats – group statistics\n"
+        "⏱ /autodelete &lt;sec&gt;\n"
+        "⚖️ /warnlimit &lt;n&gt; • /warnaction mute|kick|ban\n\n"
+        "<b>Owner (bot owner):</b> /panel • /broadcast • /stats (private)"
+    ),
+}
+
+
+def help_home_text():
+    return (
+        f"📚 <b>Help Menu</b>\n{LINE}\n"
+        "Neeche se category chuniye 👇"
+    )
+
+
+def help_home_kb():
+    return Kb(
+        [
+            [Btn("🛡 Moderation", callback_data="help:mod"), Btn("👋 Welcome", callback_data="help:welcome")],
+            [Btn("🧹 Automod", callback_data="help:auto"), Btn("🧰 Tools", callback_data="help:tools")],
+            [Btn("📊 Management", callback_data="help:manage"), Btn("📜 Full list", callback_data="help:all")],
+            [Btn("🏠 Home", callback_data="home:start")],
+        ]
+    )
+
+
+@app.on_message(filters.command("help"))
+async def help_cmd(client, message):
+    m = await message.reply_text(help_home_text(), reply_markup=help_home_kb())
+    if message.chat.type != enums.ChatType.PRIVATE:
+        autodel(message.chat.id, m, 180)
+
+
+INFO_PAGES = {
+    "features": (
+        f"✨ <b>Features</b>\n{LINE}\n"
+        "🛡 Ban / Mute / Kick / Warn system\n"
+        "👋 Welcome &amp; goodbye with placeholders\n"
+        "🔐 Button ya Math-CAPTCHA verification\n"
+        "📢 Force subscribe (channel join zaroori)\n"
+        "🧹 Automod: links, blacklist, flood, locks\n"
+        "🚨 Anti-raid &amp; Anti-bot\n"
+        "🔎 Keyword filters &amp; custom commands\n"
+        "📊 Group stats &amp; top active users\n"
+        "📝 Log channel &amp; report system\n"
+        "⚙️ Poora button settings panel"
+    ),
+    "setup": (
+        f"🚀 <b>Setup Guide</b>\n{LINE}\n"
+        "1️⃣ \"➕ Apne Group me add karein\" dabayein\n"
+        "2️⃣ Bot ko <b>admin</b> banayein (Delete, Ban/Restrict, Invite)\n"
+        "3️⃣ Group me /settings kholkar features ON karein\n"
+        "4️⃣ /setwelcome aur /setrules se customize karein\n"
+        "5️⃣ Madad ke liye /help"
+    ),
+}
+
+
+@app.on_callback_query(filters.regex(r"^(help|home|info):"))
+async def nav_cb(client, cb):
+    kind, page = cb.data.split(":", 1)
+    private = cb.message.chat.type == enums.ChatType.PRIVATE
+    back = Kb([[Btn("⬅️ Back", callback_data="help:home" if kind == "help" else "home:start"),
+                Btn("🏠 Home", callback_data="home:start")]])
+    if kind == "home":
+        text, kb = await start_content(client, cb.from_user, private)
+    elif kind == "help":
+        if page == "home":
+            text, kb = help_home_text(), help_home_kb()
+        elif page == "all":
+            text, kb = HELP, Kb([[Btn("⬅️ Back", callback_data="help:home"), Btn("🏠 Home", callback_data="home:start")]])
+        else:
+            text, kb = HELP_PAGES.get(page, help_home_text()), Kb(
+                [[Btn("⬅️ Back", callback_data="help:home"), Btn("🏠 Home", callback_data="home:start")]]
+            )
+    else:
+        text, kb = INFO_PAGES.get(page, "—"), back
+    await ui_edit(cb, text, kb)
+    await cb.answer()
+
+
+# ----- Settings dashboard -------------------------------------------------- #
+def _yn(cid, key):
+    return "✅" if cfg(cid, key) == "1" else "❌"
+
+
+def panel_text(chat):
+    cid = chat.id
+    ad = cfg(cid, "autodelete")
+    fl = cfg(cid, "flood_limit")
+    rl = cfg(cid, "raid_limit")
+    locks = [x for x in cfg(cid, "locks").split(",") if x]
+    return (
+        f"⚙️ <b>Group Settings</b>\n<i>{html.escape(chat.title or '')}</i>\n{LINE}\n"
+        f"👋 Welcome: {_yn(cid, 'welcome_on')}   🚪 Goodbye: {_yn(cid, 'goodbye_on')}\n"
+        f"🛡 Verify: <b>{cfg(cid, 'verify')}</b>   🧹 Service clean: {_yn(cid, 'clean_service')}\n"
+        f"🔗 Anti-link: {_yn(cid, 'antilink')}   🤖 Anti-bot: {_yn(cid, 'antibot')}\n"
+        f"🌊 Flood: <b>{'off' if fl == '0' else fl + ' msg/10s'}</b>   🚨 Raid: <b>{'off' if rl == '0' else rl + ' join/30s'}</b>\n"
+        f"⚖️ Warns: <b>{cfg(cid, 'warn_limit')}</b> → <b>{cfg(cid, 'warn_action')}</b>\n"
+        f"⏱ Auto-delete: <b>{'off' if ad == '0' else ad + 's'}</b>\n"
+        f"📢 Force sub: <b>{'on' if cfg(cid, 'forcesub') else 'off'}</b>   📝 Log: <b>{'on' if cfg(cid, 'logchan') else 'off'}</b>\n"
+        f"🔒 Locks: <b>{', '.join(locks) if locks else 'none'}</b>\n"
+        f"📜 Rules: <b>{'set' if cfg(cid, 'rules') else 'not set'}</b>\n"
+        f"{LINE}\nNeeche ke buttons se settings badlein 👇"
+    )
+
+
+def panel(cid):
+    def onoff(k):
+        return "✅" if cfg(cid, k) == "1" else "❌"
+
+    fl = cfg(cid, "flood_limit")
+    rl = cfg(cid, "raid_limit")
+    ad = cfg(cid, "autodelete")
+    return Kb(
+        [
+            [
+                Btn(f"👋 Welcome {onoff('welcome_on')}", callback_data="set:welcome_on"),
+                Btn(f"🚪 Goodbye {onoff('goodbye_on')}", callback_data="set:goodbye_on"),
+            ],
+            [
+                Btn(f"🛡 Verify: {cfg(cid, 'verify')}", callback_data="set:verify"),
+                Btn(f"🧹 Clean {onoff('clean_service')}", callback_data="set:clean_service"),
+            ],
+            [
+                Btn(f"🔗 Anti-link {onoff('antilink')}", callback_data="set:antilink"),
+                Btn(f"🤖 Anti-bot {onoff('antibot')}", callback_data="set:antibot"),
+            ],
+            [
+                Btn(f"🌊 Flood: {'off' if fl == '0' else fl}", callback_data="set:flood"),
+                Btn(f"🚨 Raid: {'off' if rl == '0' else rl}", callback_data="set:raid"),
+            ],
+            [
+                Btn(f"⚖️ Action: {cfg(cid, 'warn_action')}", callback_data="set:warn_action"),
+                Btn(f"⏱ Del: {'off' if ad == '0' else ad + 's'}", callback_data="set:autodelete"),
+            ],
+            [
+                Btn("➖", callback_data="set:warn_dn"),
+                Btn(f"Warn limit: {cfg(cid, 'warn_limit')}", callback_data="set:noop"),
+                Btn("➕", callback_data="set:warn_up"),
+            ],
+            [Btn("🔒 Locks", callback_data="set:locks"), Btn("📊 Stats", callback_data="set:stats")],
+            [Btn("📜 Rules", callback_data="set:rules"), Btn("📚 Help", callback_data="set:help")],
+            [Btn("✖️ Close", callback_data="set:close")],
+        ]
+    )
+
+
+def locks_text():
+    return f"🔒 <b>Locks</b>\n{LINE}\nButton dabakar lock/unlock karein.\n🔒 = locked (message delete hoga)\n🔓 = allowed"
+
+
+def locks_kb(cid):
+    cur = {x for x in cfg(cid, "locks").split(",") if x}
+    rows, row = [], []
+    for n in sorted(LOCKS):
+        row.append(Btn(f"{'🔒' if n in cur else '🔓'} {n}", callback_data=f"lk:{n}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([Btn("⬅️ Back", callback_data="lk:back")])
+    return Kb(rows)
+
+
+@app.on_message(filters.command("settings") & filters.group)
+@admin_only
+async def settings_cmd(client, message):
+    await message.reply_text(panel_text(message.chat), reply_markup=panel(message.chat.id))
+
+
+@app.on_callback_query(filters.regex(r"^set:"))
+async def settings_cb(client, cb):
+    chat = cb.message.chat
+    cid = chat.id
+    key = cb.data.split(":", 1)[1]
+    if not await is_admin(client, cid, cb.from_user.id):
+        return await cb.answer("⛔ Sirf admins ke liye!", show_alert=True)
+    if key == "close":
+        try:
+            await cb.message.delete()
+        except RPCError:
+            pass
+        return
+    if key == "noop":
+        return await cb.answer()
+    if key == "stats":
+        m = await client.send_message(cid, await build_stats(client, cid))
+        autodel(cid, m, 60)
+        return await cb.answer()
+    if key == "rules":
+        r = cfg(cid, "rules")
+        m = await client.send_message(cid, f"📜 <b>Group Rules</b>\n\n{r}" if r else "📜 Abhi koi rules set nahi hain. /setrules se set karein.")
+        autodel(cid, m, 60)
+        return await cb.answer()
+    if key == "help":
+        m = await client.send_message(cid, help_home_text(), reply_markup=help_home_kb())
+        autodel(cid, m, 180)
+        return await cb.answer()
+    if key == "locks":
+        await ui_edit(cb, locks_text(), locks_kb(cid))
+        return await cb.answer()
+
+    if key in ("welcome_on", "goodbye_on", "clean_service", "antilink", "antibot"):
+        setcfg(cid, key, "0" if cfg(cid, key) == "1" else "1")
+    elif key == "flood":
+        cur = cfg(cid, "flood_limit")
+        cur = cur if cur in FLOOD_CYCLE else "0"
+        setcfg(cid, "flood_limit", FLOOD_CYCLE[(FLOOD_CYCLE.index(cur) + 1) % len(FLOOD_CYCLE)])
+    elif key == "raid":
+        cur = cfg(cid, "raid_limit")
+        cur = cur if cur in RAID_CYCLE else "0"
+        setcfg(cid, "raid_limit", RAID_CYCLE[(RAID_CYCLE.index(cur) + 1) % len(RAID_CYCLE)])
+    elif key == "verify":
+        cur = cfg(cid, "verify")
+        setcfg(cid, "verify", VERIFY_CYCLE[(VERIFY_CYCLE.index(cur) + 1) % 3])
+    elif key == "warn_action":
+        cur = cfg(cid, "warn_action")
+        setcfg(cid, "warn_action", ACTION_CYCLE[(ACTION_CYCLE.index(cur) + 1) % 3])
+    elif key == "autodelete":
+        cur = cfg(cid, "autodelete")
+        cur = cur if cur in AD_CYCLE else "0"
+        setcfg(cid, "autodelete", AD_CYCLE[(AD_CYCLE.index(cur) + 1) % len(AD_CYCLE)])
+    elif key in ("warn_up", "warn_dn"):
+        n = int(cfg(cid, "warn_limit")) + (1 if key == "warn_up" else -1)
+        setcfg(cid, "warn_limit", min(10, max(1, n)))
+    await ui_edit(cb, panel_text(chat), panel(cid))
+    await cb.answer("✅ Updated")
+
+
+@app.on_callback_query(filters.regex(r"^lk:"))
+async def locks_cb(client, cb):
+    chat = cb.message.chat
+    cid = chat.id
+    if not await is_admin(client, cid, cb.from_user.id):
+        return await cb.answer("⛔ Sirf admins ke liye!", show_alert=True)
+    name = cb.data.split(":", 1)[1]
+    if name == "back":
+        await ui_edit(cb, panel_text(chat), panel(cid))
+        return await cb.answer()
+    if name in LOCKS:
+        cur = {x for x in cfg(cid, "locks").split(",") if x}
+        if name in cur:
+            cur.discard(name)
+        else:
+            cur.add(name)
+        setcfg(cid, "locks", ",".join(sorted(cur)))
+        await ui_edit(cb, locks_text(), locks_kb(cid))
+    await cb.answer()
+
+
+# ----- Stats (group + owner global) --------------------------------------- #
+async def build_stats(client, cid):
+    try:
+        members = await client.get_chat_members_count(cid)
+    except RPCError:
+        members = "?"
+    day = time.strftime("%Y-%m-%d")
+    row = db.execute(
+        "SELECT joins, leaves, messages FROM stats WHERE chat_id=? AND day=?", (cid, day)
+    ).fetchone() or (0, 0, 0)
+    week = db.execute(
+        "SELECT SUM(joins), SUM(leaves), SUM(messages) FROM stats WHERE chat_id=? AND day>=?",
+        (cid, time.strftime("%Y-%m-%d", time.localtime(time.time() - 6 * 86400))),
+    ).fetchone()
+    top = db.execute(
+        "SELECT name, messages FROM users WHERE chat_id=? ORDER BY messages DESC LIMIT 5", (cid,)
+    ).fetchall()
+    text = (
+        f"📊 <b>Group Stats</b>\n{LINE}\n"
+        f"👥 Total members: <b>{members}</b>\n\n"
+        f"📅 <b>Aaj</b>\n➕ {row[0]} joins • ➖ {row[1]} leaves • 💬 {row[2]} msgs\n\n"
+        f"🗓 <b>Pichhle 7 din</b>\n➕ {week[0] or 0} joins • ➖ {week[1] or 0} leaves • 💬 {week[2] or 0} msgs\n"
+    )
+    if top:
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        text += f"\n🏆 <b>Top active</b>\n" + "\n".join(
+            f"{medals[i]} {html.escape(n or 'User')} — {m}" for i, (n, m) in enumerate(top)
+        )
+    return text
+
+
+@app.on_message(filters.command("stats"))
+async def stats_cmd(client, message):
+    if message.chat.type == enums.ChatType.PRIVATE:
+        if not message.from_user or not is_owner(message.from_user.id):
+            return await message.reply_text("📊 Stats dekhne ke liye group me /stats use karein.")
+        return await message.reply_text(owner_text(), reply_markup=owner_kb())
+    await say(message, await build_stats(client, message.chat.id))
+
+
+# ----- Owner panel --------------------------------------------------------- #
+def counts():
+    u = db.execute("SELECT COUNT(*) FROM bot_users").fetchone()[0]
+    g = db.execute("SELECT COUNT(*) FROM bot_chats").fetchone()[0]
+    return u, g
+
+
+def owner_text():
+    u, g = counts()
+    return (
+        f"👑 <b>Owner Panel</b>\n{LINE}\n"
+        f"👤 Bot users: <b>{u}</b>\n"
+        f"👥 Groups: <b>{g}</b>\n"
+        f"🤖 Version: <b>v{__version__}</b>\n{LINE}\n"
+        "Neeche se option chuniye 👇"
+    )
+
+
+def owner_kb():
+    return Kb(
+        [
+            [Btn("👥 Groups list", callback_data="own:groups"), Btn("📣 Broadcast", callback_data="own:bc")],
+            [Btn("🔄 Refresh", callback_data="own:home"), Btn("✖️ Close", callback_data="own:close")],
+        ]
+    )
+
+
+@app.on_message(filters.command("panel"))
+async def panel_cmd(client, message):
+    if not message.from_user or not is_owner(message.from_user.id):
+        if message.chat.type == enums.ChatType.PRIVATE:
+            await message.reply_text("⛔ Ye panel sirf bot owner ke liye hai.\n(Owner ID <code>OWNER_IDS</code> me set hoti hai.)")
+        return
+    await message.reply_text(owner_text(), reply_markup=owner_kb())
+
+
+@app.on_callback_query(filters.regex(r"^own:"))
+async def owner_cb(client, cb):
+    if not is_owner(cb.from_user.id):
+        return await cb.answer("⛔ Sirf bot owner ke liye!", show_alert=True)
+    page = cb.data.split(":", 1)[1]
+    back = Kb([[Btn("⬅️ Back", callback_data="own:home")]])
+    if page == "close":
+        try:
+            await cb.message.delete()
+        except RPCError:
+            pass
+        return
+    if page == "home":
+        await ui_edit(cb, owner_text(), owner_kb())
+    elif page == "groups":
+        rows = db.execute(
+            "SELECT title, chat_id FROM bot_chats ORDER BY first_seen DESC LIMIT 20"
+        ).fetchall()
+        text = f"👥 <b>Groups</b> (latest 20)\n{LINE}\n" + (
+            "\n".join(f"• {html.escape(t or 'Untitled')} — <code>{i}</code>" for t, i in rows)
+            if rows else "Abhi koi group record nahi hua."
+        )
+        await ui_edit(cb, text, back)
+    elif page == "bc":
+        text = (
+            f"📣 <b>Broadcast</b>\n{LINE}\n"
+            "1️⃣ Bot ko private me wo message bhejein jo sab tak pahunchana hai\n"
+            "2️⃣ Us message par <b>reply</b> karke /broadcast likhein\n"
+            "3️⃣ Users / Groups / All me se chuniye"
+        )
+        await ui_edit(cb, text, back)
+    await cb.answer()
+
+
+BAD_TARGET = (
+    "USER_IS_BLOCKED", "INPUT_USER_DEACTIVATED", "USER_DEACTIVATED",
+    "PEER_ID_INVALID", "CHAT_WRITE_FORBIDDEN", "CHANNEL_PRIVATE",
+)
+
+
+@app.on_message(filters.command("broadcast"))
+async def broadcast_cmd(client, message):
+    if not message.from_user or not is_owner(message.from_user.id):
+        if message.chat.type == enums.ChatType.PRIVATE:
+            await message.reply_text("⛔ Ye command sirf bot owner ke liye hai.")
+        return
+    r = message.reply_to_message
+    if not r:
+        return await message.reply_text("⚠️ Jo message bhejna hai us par reply karke /broadcast likhein.")
+    u, g = counts()
+    base = f"{message.chat.id}:{r.id}"
+    kb = Kb(
+        [
+            [Btn(f"👤 Users ({u})", callback_data=f"bc:users:{base}"), Btn(f"👥 Groups ({g})", callback_data=f"bc:groups:{base}")],
+            [Btn(f"🌐 All ({u + g})", callback_data=f"bc:all:{base}")],
+            [Btn("✖️ Cancel", callback_data="bc:cancel:0:0")],
+        ]
+    )
+    await message.reply_text(f"📣 <b>Broadcast</b>\n{LINE}\nYe message kis ko bhejna hai?", reply_markup=kb, reply_to_message_id=r.id)
+
+
+async def _run_broadcast(client, status, src_chat, src_msg, targets):
+    sent = failed = 0
+    for i, t in enumerate(targets, 1):
+        try:
+            await client.copy_message(t, src_chat, src_msg)
+            sent += 1
+        except FloodWait as e:
+            await asyncio.sleep(e.value + 1)
+            try:
+                await client.copy_message(t, src_chat, src_msg)
+                sent += 1
+            except Exception:
+                failed += 1
+        except RPCError as e:
+            failed += 1
+            if any(b in str(e).upper() for b in BAD_TARGET):
+                db.execute("DELETE FROM bot_users WHERE user_id=?", (t,))
+                db.execute("DELETE FROM bot_chats WHERE chat_id=?", (t,))
+                db.commit()
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)
+        if i % 50 == 0:
+            try:
+                await status.edit_text(f"⏳ Broadcast chal raha hai... {i}/{len(targets)}")
+            except RPCError:
+                pass
+    try:
+        await status.edit_text(
+            f"✅ <b>Broadcast complete</b>\n{LINE}\n📤 Sent: <b>{sent}</b>\n❌ Failed: <b>{failed}</b>"
+        )
+    except RPCError:
+        pass
+
+
+@app.on_callback_query(filters.regex(r"^bc:"))
+async def broadcast_cb(client, cb):
+    if not is_owner(cb.from_user.id):
+        return await cb.answer("⛔ Sirf bot owner ke liye!", show_alert=True)
+    _, mode, chat_id, msg_id = cb.data.split(":")
+    if mode == "cancel":
+        await ui_edit(cb, "❌ Broadcast cancel kar diya.")
+        return await cb.answer()
+    targets = []
+    if mode in ("users", "all"):
+        targets += [x[0] for x in db.execute("SELECT user_id FROM bot_users")]
+    if mode in ("groups", "all"):
+        targets += [x[0] for x in db.execute("SELECT chat_id FROM bot_chats")]
+    targets = list(dict.fromkeys(targets))
+    if not targets:
+        await ui_edit(cb, "⚠️ Koi target nahi mila.")
+        return await cb.answer()
+    await ui_edit(cb, f"⏳ Broadcast shuru... {len(targets)} targets")
+    await cb.answer()
+    t = asyncio.create_task(_run_broadcast(client, cb.message, int(chat_id), int(msg_id), targets))
+    _tasks.add(t)
+    t.add_done_callback(_tasks.discard)
+
+
+@app.on_message(filters.private, group=7)
+async def track_private(client, message):
+    if message.from_user:
+        track_user(message.from_user.id)
+
+
+# ----- Keyword filters ----------------------------------------------------- #
+@app.on_message(filters.command("filter") & filters.group)
+@admin_only
+async def filter_cmd(client, message):
+    raw = message.text.partition(" ")[2].strip()
+    if "|" not in raw:
+        return await say(message, "Usage: /filter keyword | reply text")
+    keyword, reply = [x.strip() for x in raw.split("|", 1)]
+    if not keyword or not reply or len(keyword) > 80 or len(reply) > 800:
+        return await say(message, "⚠️ Keyword/reply invalid ya bahut lamba hai.")
+    db.execute(
+        "INSERT OR REPLACE INTO kwfilters VALUES (?,?,?)",
+        (message.chat.id, keyword.casefold(), reply),
+    )
+    db.commit()
+    await say(message, f"✅ Filter save: <code>{html.escape(keyword)}</code>")
+
+
+@app.on_message(filters.command("filters") & filters.group)
+async def filters_list_cmd(client, message):
+    rows = db.execute(
+        "SELECT keyword FROM kwfilters WHERE chat_id=? ORDER BY keyword LIMIT 50", (message.chat.id,)
+    ).fetchall()
+    await say(message, "🔎 <b>Filters</b>\n" + "\n".join(f"• <code>{html.escape(r[0])}</code>" for r in rows) if rows else "Koi filter set nahi hai.")
+
+
+@app.on_message(filters.command("stopfilter") & filters.group)
+@admin_only
+async def stopfilter_cmd(client, message):
+    keyword = message.text.partition(" ")[2].strip().casefold()
+    if not keyword:
+        return await say(message, "Usage: /stopfilter keyword")
+    cur = db.execute("DELETE FROM kwfilters WHERE chat_id=? AND keyword=?", (message.chat.id, keyword))
+    db.commit()
+    await say(message, "🗑 Filter hata diya." if cur.rowcount else "Aisa filter nahi mila.")
+
+
+@app.on_message(filters.group & filters.text & ~filters.service, group=6)
+async def keyword_filter_handler(client, message):
+    text = message.text or ""
+    if not text or text.startswith("/"):
+        return
+    if not message.from_user or message.from_user.is_bot:
+        return
+    rows = db.execute("SELECT keyword, reply FROM kwfilters WHERE chat_id=?", (message.chat.id,)).fetchall()
+    low = text.casefold()
+    for keyword, reply in rows:
+        if keyword in low:
+            await say(message, reply)
+            break
 
 
 # --------------------------------------------------------------------------- #
