@@ -35,6 +35,13 @@ Dead users/groups (jinhone bot block kiya ya bot hata diya) broadcast ke dauran 
 
 `/filter hello | Namaste!` – jab koi message me "hello" likhe to bot reply karta hai. `/filters` se list, `/stopfilter hello` se hatayein.
 
+## 🖱 One-Click Buttons
+
+- **`/menu` – Control Center** (sirf admins): Settings, Mod tools, 🚧 Lock / ✅ Unlock group, 🐢 Slowmode presets (Off/10s/30s/1m/5m/15m/1h), 🌙 Night mode presets (+ 🇮🇳 India time), Stats, Rules, Help — sab ek click me
+- **`/mod` – Mod Panel:** kisi user ke message par reply karke `/mod` likhein, phir buttons: ⚠️ Warn, ✅ Unwarn, 📋 Warns, 🔇 Mute 1h/1d, 🔊 Unmute, 👢 Kick, 🔨 Ban, ♻️ Unban, 🗑 Msg delete
+- **`/report`:** members report karein to admins ko turant ⚠️ Warn / 🔇 Mute / 🔨 Ban / 🗑 Msg delete / ✅ Ignore buttons milte hain
+- **`/settings` → ✏️ Welcome style:** 4 ready welcome styles ek click me (Simple, Friendly, Formal, Minimal)
+
 ## 🚀 Advanced Features (v1.0)
 
 | Command | Kaam |

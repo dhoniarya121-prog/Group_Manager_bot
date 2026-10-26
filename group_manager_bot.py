@@ -146,7 +146,7 @@ RESERVED = {
     "approve", "unapprove", "approved", "lock", "unlock", "locks", "antilink",
     "antibot", "setflood", "antiraid", "addblacklist", "rmblacklist", "blacklist",
     "setlog", "report", "admins", "slowmode", "pin", "unpin", "unpinall",
-    "promote", "demote", "antimention", "tban", "lockdown", "nightmode", "timezone", "schedule", "repeat",
+    "promote", "demote", "antimention", "menu", "mod", "tban", "lockdown", "nightmode", "timezone", "schedule", "repeat",
     "schedules", "unschedule", "rank", "top", "levels", "antirepeat", "panel", "broadcast", "filter", "filters", "stopfilter",
 }
 
@@ -1360,7 +1360,8 @@ async def report_cmd(client, message):
     text = f"🚨 <b>Report</b> by {actor(message)}{tags}"
     if link:
         text += f'\n<a href="{link}">Message dekhein</a>'
-    await client.send_message(cid, text, reply_to_message_id=r.id)
+    rkb = mc_kb(r.from_user.id, r.id, compact=True) if r.from_user and not r.from_user.is_bot else None
+    await client.send_message(cid, text, reply_to_message_id=r.id, reply_markup=rkb)
     await log_action(client, message.chat, f"🚨 <b>Report</b> by {actor(message)}" + (f"\n{link}" if link else ""))
 
 
@@ -1577,7 +1578,7 @@ async def start_content(client, user, private=True):
         text = (
             f"✨ <b>Group Manager Bot</b> • v{__version__}\n{LINE}\n"
             "Main active hoon! 🟢\n"
-            "⚙️ Settings: /settings   📚 Help: /help\n"
+            "🎛 Control Center: /menu   ⚙️ Settings: /settings\n📚 Help: /help\n"
             f"{LINE}\n👨‍💻 @roaroic0"
         )
         rows = [
@@ -1791,6 +1792,7 @@ def panel(cid):
                 Btn(f"Warn limit: {cfg(cid, 'warn_limit')}", callback_data="set:noop"),
                 Btn("➕", callback_data="set:warn_up"),
             ],
+            [Btn("✏️ Welcome style", callback_data="set:wstyle"), Btn("🎛 Control Center", callback_data="cc:home")],
             [Btn("🔒 Locks", callback_data="set:locks"), Btn("📊 Stats", callback_data="set:stats")],
             [Btn("📜 Rules", callback_data="set:rules"), Btn("📚 Help", callback_data="set:help")],
             [Btn("✖️ Close", callback_data="set:close")],
@@ -1849,6 +1851,9 @@ async def settings_cb(client, cb):
     if key == "help":
         m = await client.send_message(cid, help_home_text(), reply_markup=help_home_kb())
         autodel(cid, m, 180)
+        return await cb.answer()
+    if key == "wstyle":
+        await ui_edit(cb, wstyle_text(), wstyle_kb())
         return await cb.answer()
     if key == "locks":
         await ui_edit(cb, locks_text(), locks_kb(cid))
@@ -2596,6 +2601,327 @@ async def level_up_handler(client, message):
             cid, f"🎉 {mention(u)} ab <b>Level {now}</b> par pahunch gaya! {level_title(now)}"
         )
         autodel(cid, m, 30)
+
+
+# --------------------------------------------------------------------------- #
+# ONE-CLICK UI: /mod panel, report buttons, /menu control center,
+# slowmode / night presets, welcome style presets
+# --------------------------------------------------------------------------- #
+HELP_PAGES["manage"] += (
+    "\n\n🎛 /menu – Control Center (sab kuch ek click me)\n"
+    "🛠 /mod – user ke message par reply karke ek-click mod panel"
+)
+INFO_PAGES["features"] += "\n🎛 One-click Control Center &amp; Mod panel"
+HELP = HELP.replace(
+    "<b>Advanced</b>",
+    "<b>One-click buttons</b>\n/menu · /mod (reply karke)\n\n<b>Advanced</b>",
+)
+
+WELCOME_PRESETS = {
+    "1": ("Simple", "👋 Welcome {mention} to <b>{chat}</b>!"),
+    "2": ("Friendly", "🎉 Hey {mention}! <b>{chat}</b> family me swagat hai 🥳\nRules padhna mat bhoolna: /rules"),
+    "3": ("Formal", "Namaste {mention}, <b>{chat}</b> me aapka swagat hai. Kripya group ke niyam /rules me padhein."),
+    "4": ("Minimal", "{mention} joined 👋"),
+}
+
+
+# ----- Mod panel (one click per action) ------------------------------------- #
+def mc_kb(uid, mid, compact=False):
+    c = 1 if compact else 0
+
+    def d(a):
+        return f"mc:{a}:{uid}:{mid}:{c}"
+
+    if compact:
+        return Kb(
+            [
+                [Btn("⚠️ Warn", callback_data=d("wn")), Btn("🔇 Mute 1h", callback_data=d("m1")), Btn("🔨 Ban", callback_data=d("bn"))],
+                [Btn("🗑 Msg delete", callback_data=d("dl")), Btn("✅ Ignore", callback_data=d("cl"))],
+            ]
+        )
+    return Kb(
+        [
+            [Btn("⚠️ Warn", callback_data=d("wn")), Btn("✅ Unwarn", callback_data=d("uw")), Btn("📋 Warns", callback_data=d("wi"))],
+            [Btn("🔇 Mute 1h", callback_data=d("m1")), Btn("🔇 Mute 1d", callback_data=d("m24")), Btn("🔊 Unmute", callback_data=d("um"))],
+            [Btn("👢 Kick", callback_data=d("kk")), Btn("🔨 Ban", callback_data=d("bn")), Btn("♻️ Unban", callback_data=d("ub"))],
+            [Btn("🗑 Msg delete", callback_data=d("dl")), Btn("✖️ Close", callback_data=d("cl"))],
+        ]
+    )
+
+
+def mc_text(user, cid, last=""):
+    note = f"\n{last}" if last else ""
+    return (
+        f"🛠 <b>Mod Panel</b>\n{LINE}\n"
+        f"👤 {mention(user)}\n🆔 <code>{user.id}</code>\n"
+        f"⚠️ Warns: <b>{get_warns(cid, user.id)}/{cfg(cid, 'warn_limit')}</b>{note}\n"
+        f"{LINE}\nEk click me action chuniye 👇"
+    )
+
+
+@app.on_message(filters.command("mod") & filters.group)
+@admin_only
+async def mod_cmd(client, message):
+    r = await prep(client, message)
+    if not r:
+        return
+    user, _ = r
+    mid = message.reply_to_message.id if message.reply_to_message else 0
+    m = await message.reply_text(mc_text(user, message.chat.id), reply_markup=mc_kb(user.id, mid))
+    autodel(message.chat.id, m, 300)
+
+
+@app.on_callback_query(filters.regex(r"^mc:"))
+async def mc_cb(client, cb):
+    _, act, uid, mid, compact = cb.data.split(":")
+    uid, mid, compact = int(uid), int(mid), compact == "1"
+    chat = cb.message.chat
+    cid = chat.id
+    if not await is_admin(client, cid, cb.from_user.id):
+        return await cb.answer("⛔ Sirf admins ke liye!", show_alert=True)
+    if act == "cl":
+        try:
+            await cb.message.delete()
+        except RPCError:
+            pass
+        return
+    try:
+        user = await client.get_users(uid)
+    except Exception:
+        return await cb.answer("User nahi mila.", show_alert=True)
+    if act in ("wn", "m1", "m24", "kk", "bn") and (
+        uid == await my_id(client) or await is_admin(client, cid, uid)
+    ):
+        return await cb.answer("⚠️ Admin ya bot par ye action nahi ho sakta.", show_alert=True)
+
+    result = ""
+    try:
+        if act == "wn":
+            count = set_warns(cid, uid, get_warns(cid, uid) + 1)
+            limit = int(cfg(cid, "warn_limit"))
+            if count >= limit:
+                action = cfg(cid, "warn_action")
+                problem = await punish(client, cid, uid, action)
+                set_warns(cid, uid, 0)
+                if problem:
+                    return await cb.answer(f"❌ {problem[:150]}", show_alert=True)
+                result = f"🚫 Warn limit poori → <b>{action}</b>"
+            else:
+                result = f"⚠️ Warn diya ({count}/{limit})"
+        elif act == "uw":
+            n = set_warns(cid, uid, get_warns(cid, uid) - 1)
+            result = f"✅ Ek warn hata diya (ab {n})"
+        elif act == "wi":
+            return await cb.answer(f"Warns: {get_warns(cid, uid)}/{cfg(cid, 'warn_limit')}", show_alert=True)
+        elif act in ("m1", "m24"):
+            hours = 1 if act == "m1" else 24
+            await client.restrict_chat_member(
+                cid, uid, ChatPermissions(), until_date=datetime.now() + timedelta(hours=hours)
+            )
+            result = f"🔇 Mute: {'1 ghanta' if hours == 1 else '1 din'}"
+        elif act == "um":
+            await unrestrict(client, cid, uid)
+            result = "🔊 Unmute ho gaya"
+        elif act == "kk":
+            await kick(client, cid, uid)
+            result = "👢 Kick kar diya"
+        elif act == "bn":
+            await client.ban_chat_member(cid, uid)
+            result = "🔨 Ban kar diya"
+        elif act == "ub":
+            await client.unban_chat_member(cid, uid)
+            result = "♻️ Unban ho gaya"
+        elif act == "dl":
+            if not mid:
+                return await cb.answer("Is panel ke saath koi message juda nahi hai.", show_alert=True)
+            await client.delete_messages(cid, mid)
+            result = "🗑 Message delete ho gaya"
+    except RPCError as e:
+        return await cb.answer(f"❌ {str(e)[:150]}", show_alert=True)
+
+    await log_action(
+        client, chat,
+        f"🛠 <b>Mod panel</b>: {result}\nUser: {mention(user)} (<code>{uid}</code>)\nBy: {mention(cb.from_user)}",
+    )
+    await ui_edit(cb, mc_text(user, cid, f"✅ {result}"), mc_kb(uid, mid, compact))
+    await cb.answer("✅ Done")
+
+
+# ----- Control center ------------------------------------------------------- #
+def cc_text(chat, note=""):
+    extra = f"\n{note}\n" if note else "\n"
+    return (
+        f"🎛 <b>Control Center</b>\n<i>{html.escape(chat.title or '')}</i>\n{LINE}{extra}"
+        "Sab kuch ek click me 👇"
+    )
+
+
+def cc_kb():
+    return Kb(
+        [
+            [Btn("⚙️ Settings", callback_data="cc:settings"), Btn("🛠 Mod tools", callback_data="cc:mod")],
+            [Btn("🚧 Lock group", callback_data="cc:lock:on"), Btn("✅ Unlock group", callback_data="cc:lock:off")],
+            [Btn("🐢 Slowmode", callback_data="cc:slow"), Btn("🌙 Night mode", callback_data="cc:night")],
+            [Btn("📊 Stats", callback_data="cc:stats"), Btn("📜 Rules", callback_data="cc:rules")],
+            [Btn("📚 Help", callback_data="cc:help"), Btn("✖️ Close", callback_data="cc:close")],
+        ]
+    )
+
+
+def slow_kb():
+    opts = [("Off", 0), ("10s", 10), ("30s", 30), ("1m", 60), ("5m", 300), ("15m", 900), ("1h", 3600)]
+    rows = [[Btn(f"🐢 {lbl}", callback_data=f"cc:sl:{n}") for lbl, n in opts[i:i + 4]] for i in range(0, len(opts), 4)]
+    rows.append([Btn("⬅️ Back", callback_data="cc:home")])
+    return Kb(rows)
+
+
+def night_kb():
+    return Kb(
+        [
+            [Btn("🌙 Turn ON", callback_data="cc:ng:on"), Btn("☀️ Turn OFF", callback_data="cc:ng:off")],
+            [Btn("22:00–06:00", callback_data="cc:ng:2200-0600"), Btn("23:00–07:00", callback_data="cc:ng:2300-0700")],
+            [Btn("00:00–07:00", callback_data="cc:ng:0000-0700"), Btn("🇮🇳 India time", callback_data="cc:tzin")],
+            [Btn("⬅️ Back", callback_data="cc:home")],
+        ]
+    )
+
+
+def night_page_text(cid):
+    return (
+        f"🌙 <b>Night mode</b>\n{LINE}\n"
+        f"Status: <b>{night_label(cid)}</b>\n"
+        f"🕒 Time zone: UTC{cfg(cid, 'tz')} (abhi {local_now(cid).strftime('%H:%M')})\n\n"
+        "Preset chuniye 👇\n<i>Doosra time zone: /timezone +5:30</i>"
+    )
+
+
+@app.on_message(filters.command("menu"))
+async def menu_cmd(client, message):
+    if message.chat.type == enums.ChatType.PRIVATE:
+        return await message.reply_text("🎛 Ye menu group ke liye hai. Group me /menu likhein.")
+    if not message.from_user or not await is_admin(client, message.chat.id, message.from_user.id):
+        return await say(message, "⛔ Ye menu sirf admins ke liye hai.")
+    m = await message.reply_text(cc_text(message.chat), reply_markup=cc_kb())
+    autodel(message.chat.id, m, 600)
+
+
+@app.on_callback_query(filters.regex(r"^cc:"))
+async def cc_cb(client, cb):
+    chat = cb.message.chat
+    cid = chat.id
+    if not await is_admin(client, cid, cb.from_user.id):
+        return await cb.answer("⛔ Sirf admins ke liye!", show_alert=True)
+    parts = cb.data.split(":")
+    page = parts[1]
+    arg = parts[2] if len(parts) > 2 else ""
+    back = Kb([[Btn("⬅️ Back", callback_data="cc:home")]])
+
+    if page == "close":
+        try:
+            await cb.message.delete()
+        except RPCError:
+            pass
+        return
+    if page == "home":
+        await ui_edit(cb, cc_text(chat), cc_kb())
+    elif page == "settings":
+        await ui_edit(cb, panel_text(chat), panel(cid))
+    elif page == "mod":
+        await ui_edit(
+            cb,
+            f"🛠 <b>Mod tools</b>\n{LINE}\n"
+            "1️⃣ Kisi user ke message par <b>reply</b> karke /mod likhein\n"
+            "2️⃣ Warn / Mute / Kick / Ban / Msg delete — sab <b>ek click</b> me\n\n"
+            "🚨 Members /report karein to admins ko bhi wahi buttons milte hain.",
+            back,
+        )
+    elif page == "lock":
+        on = arg == "on"
+        try:
+            await client.set_chat_permissions(cid, ChatPermissions() if on else full_perms())
+        except RPCError as e:
+            return await cb.answer(f"❌ {str(e)[:150]}", show_alert=True)
+        await log_action(client, chat, f"🚧 <b>Lockdown {'ON' if on else 'OFF'}</b> by {mention(cb.from_user)}")
+        await ui_edit(cb, cc_text(chat, "🚧 Group <b>LOCK</b> ho gaya." if on else "✅ Group <b>UNLOCK</b> ho gaya."), cc_kb())
+        return await cb.answer("🚧 Locked" if on else "✅ Unlocked")
+    elif page == "slow":
+        await ui_edit(cb, f"🐢 <b>Slowmode</b>\n{LINE}\nEk click me interval chuniye 👇", slow_kb())
+    elif page == "sl":
+        n = int(arg)
+        try:
+            await client.set_slow_mode(cid, n or None)
+        except RPCError as e:
+            return await cb.answer(f"❌ {str(e)[:150]}", show_alert=True)
+        await ui_edit(
+            cb,
+            f"🐢 <b>Slowmode</b>\n{LINE}\n✅ Ab: <b>{'OFF' if n == 0 else str(n) + 's'}</b>",
+            slow_kb(),
+        )
+        return await cb.answer("✅ Done")
+    elif page == "night":
+        await ui_edit(cb, night_page_text(cid), night_kb())
+    elif page == "ng":
+        if arg == "on":
+            setcfg(cid, "night_on", "1")
+        elif arg == "off":
+            setcfg(cid, "night_on", "0")
+            if cfg(cid, "night_state") == "1":
+                await night_unlock(client, cid)
+        else:
+            setcfg(cid, "night_start", f"{arg[:2]}:{arg[2:4]}")
+            setcfg(cid, "night_end", f"{arg[5:7]}:{arg[7:9]}")
+            setcfg(cid, "night_on", "1")
+        await ui_edit(cb, night_page_text(cid), night_kb())
+        return await cb.answer("✅ Done")
+    elif page == "tzin":
+        setcfg(cid, "tz", "+05:30")
+        await ui_edit(cb, night_page_text(cid), night_kb())
+        return await cb.answer("🇮🇳 India time set")
+    elif page == "stats":
+        m = await client.send_message(cid, await build_stats(client, cid))
+        autodel(cid, m, 60)
+    elif page == "rules":
+        r = cfg(cid, "rules")
+        m = await client.send_message(cid, f"📜 <b>Group Rules</b>\n\n{r}" if r else "📜 Abhi koi rules set nahi hain. /setrules se set karein.")
+        autodel(cid, m, 60)
+    elif page == "help":
+        m = await client.send_message(cid, help_home_text(), reply_markup=help_home_kb())
+        autodel(cid, m, 180)
+    await cb.answer()
+
+
+# ----- Welcome style presets (one click) ------------------------------------ #
+def wstyle_kb():
+    items = list(WELCOME_PRESETS.items())
+    rows = [
+        [Btn(f"{k}. {name}", callback_data=f"wp:{k}") for k, (name, _) in items[i:i + 2]]
+        for i in range(0, len(items), 2)
+    ]
+    rows.append([Btn("⬅️ Back", callback_data="wp:back")])
+    return Kb(rows)
+
+
+def wstyle_text():
+    body = "\n\n".join(f"<b>{k}. {name}</b>\n{html.escape(text)}" for k, (name, text) in WELCOME_PRESETS.items())
+    return f"✏️ <b>Welcome style</b>\n{LINE}\n{body}\n{LINE}\nEk click me style chuniye 👇\n<i>Apna text: /setwelcome</i>"
+
+
+@app.on_callback_query(filters.regex(r"^wp:"))
+async def wstyle_cb(client, cb):
+    chat = cb.message.chat
+    cid = chat.id
+    if not await is_admin(client, cid, cb.from_user.id):
+        return await cb.answer("⛔ Sirf admins ke liye!", show_alert=True)
+    key = cb.data.split(":", 1)[1]
+    if key == "back":
+        await ui_edit(cb, panel_text(chat), panel(cid))
+        return await cb.answer()
+    if key in WELCOME_PRESETS:
+        setcfg(cid, "welcome_text", WELCOME_PRESETS[key][1])
+        setcfg(cid, "welcome_on", "1")
+        await ui_edit(cb, panel_text(chat), panel(cid))
+        return await cb.answer(f"✅ Welcome style: {WELCOME_PRESETS[key][0]}")
+    await cb.answer()
 
 
 # --------------------------------------------------------------------------- #
