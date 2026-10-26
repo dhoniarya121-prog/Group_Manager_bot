@@ -225,3 +225,11 @@ Bot ko 24x7 chalane ke liye VPS ya hosting par `python group_manager_bot.py` cha
 - `render.yaml` – Render Blueprint
 - `.gitignore` – `.env` aur database ko GitHub se bachata hai
 - `README.md` – ye file
+
+## 🧹 Privacy + Auto-cleanup (new)
+- Group ka **har message 5 min (300s) baad auto-delete** hota hai — bot ka welcome message bhi, aur baaki bot replies bhi.
+- **Hide mode (default ON):** admin/owner ke ilawa kisi member ka message group me rukta nahi (turant delete; commands 3 sec baad). Bot ka welcome message sabko dikhta hai.
+- `/setlog` channel set ho to delete hone se pehle members ke messages wahan copy ho jaate hain, taaki admins padh sakein.
+- `/cleanup <seconds>` (0 = off) · `/hide on|off`
+- Bot ko **Delete messages** admin right zaroori hai.
+- **Admin privacy:** admin/owner ke messages bhi `/adminclean <seconds>` (default 30s) baad delete hote hain; admin `/commands` 2s me, aur bot ke command-replies bhi usi time par. Sirf welcome message 5 min tak rehta hai.

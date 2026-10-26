@@ -79,6 +79,9 @@ DEFAULTS = {
     "forcesub_link": "",
     "rules": "",
     "autodelete": "0",  # seconds, 0 = off
+    "cleanup": "300",  # group ka har message itne seconds baad delete (0 = off)
+    "admin_secs": "30",  # admin msgs + bot command-replies itne sec baad delete (0 = cleanup wala time)
+    "hide": "1",  # 1 = non-admin members ke messages turant delete (sirf admin/owner ke msgs + bot ka welcome dikhe)
     "clean_service": "0",
     "warn_limit": "3",
     "warn_action": "mute",  # mute | kick | ban
@@ -141,7 +144,7 @@ ADMIN = (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
 RESERVED = {
     "start", "help", "ban", "unban", "kick", "mute", "unmute", "warn", "unwarn",
     "warns", "purge", "id", "info", "settings", "stats", "rules", "setrules",
-    "setwelcome", "setgoodbye", "verify", "forcesub", "autodelete", "warnlimit",
+    "setwelcome", "setgoodbye", "verify", "forcesub", "autodelete", "cleanup", "hide", "adminclean", "warnlimit",
     "warnaction", "addcmd", "delcmd", "cmds",
     "approve", "unapprove", "approved", "lock", "unlock", "locks", "antilink",
     "antibot", "setflood", "antiraid", "addblacklist", "rmblacklist", "blacklist",
@@ -188,9 +191,33 @@ def autodel(chat_id, msg, secs=None):
         t.add_done_callback(_tasks.discard)
 
 
+# Bot ka har message (welcome sahit) group me CLEANUP seconds baad delete ho jaye
+_orig_send_message = app.send_message
+
+
+async def _send_and_clean(chat_id, *args, **kwargs):
+    m = await _orig_send_message(chat_id, *args, **kwargs)
+    try:
+        if m and m.chat and m.chat.type in (
+            enums.ChatType.GROUP,
+            enums.ChatType.SUPERGROUP,
+        ):
+            secs = int(cfg(m.chat.id, "cleanup"))
+            if secs > 0:
+                autodel(m.chat.id, m, secs)
+    except Exception:
+        pass
+    return m
+
+
+app.send_message = _send_and_clean
+
+
 async def say(message, text, **kw):
     m = await message.reply_text(text, **kw)
-    autodel(message.chat.id, m)
+    cid = message.chat.id
+    secs = int(cfg(cid, "autodelete")) or int(cfg(cid, "admin_secs"))
+    autodel(cid, m, secs if secs > 0 else None)
     return m
 
 
@@ -739,6 +766,86 @@ async def custom_cmd_handler(client, message):
     row = db.execute("SELECT reply FROM cmds WHERE chat_id=? AND name=?", (message.chat.id, name)).fetchone()
     if row:
         await say(message, row[0])
+
+
+# --------------------------------------------------------------------------- #
+# Privacy + auto cleanup
+#   * Admin/owner ke ilawa kisi member ka message group me nahi rukta
+#     (turant delete; commands 3 sec baad taaki bot reply kar sake).
+#     Agar /setlog channel set hai to delete se pehle message wahan copy ho jata hai.
+#   * Baaki sab (admin msgs, bot ka welcome/replies) CLEANUP seconds (default 5 min) baad delete.
+# --------------------------------------------------------------------------- #
+async def is_staff(client, message):
+    if message.sender_chat:  # anonymous admin
+        return message.sender_chat.id == message.chat.id
+    u = message.from_user
+    if not u:
+        return False
+    if u.id in OWNER_IDS:
+        return True
+    ids = await admin_ids(client, message.chat.id)
+    if u.id in ids:
+        return True
+    if not ids:  # admin list fetch fail hui -> galti se admins ke msg na udein
+        return await is_admin(client, message.chat.id, u.id)
+    return False
+
+
+@app.on_message(filters.group & ~filters.service, group=-1)
+async def privacy_cleaner(client, message):
+    cid = message.chat.id
+    secs = int(cfg(cid, "cleanup"))
+    if cfg(cid, "hide") == "1" and not await is_staff(client, message):
+        ch = cfg(cid, "logchan")
+        if ch:
+            try:
+                await message.copy(int(ch))
+            except Exception:
+                pass
+        if (message.text or message.caption or "").startswith("/"):
+            autodel(cid, message, 3)
+        else:
+            try:
+                await message.delete()
+            except RPCError:
+                pass
+        return
+    # admin/owner ka message: commands turant, normal msg admin_secs baad
+    asecs = int(cfg(cid, "admin_secs")) if cfg(cid, "hide") == "1" else secs
+    if (message.text or message.caption or "").startswith("/"):
+        asecs = min(asecs, 2) if asecs > 0 else 2
+    if asecs > 0:
+        autodel(cid, message, asecs)
+    elif secs > 0:
+        autodel(cid, message, secs)
+
+
+@app.on_message(filters.command("adminclean") & filters.group)
+@admin_only
+async def adminclean_cmd(client, message):
+    if len(message.command) < 2 or not message.command[1].isdigit():
+        return await say(message, "Usage: /adminclean &lt;seconds&gt; (default 30)\nAdmin ke messages aur bot ke command-replies itne sec baad delete.")
+    setcfg(message.chat.id, "admin_secs", int(message.command[1]))
+    await say(message, f"🕶 Admin privacy: {message.command[1]}s")
+
+
+@app.on_message(filters.command("cleanup") & filters.group)
+@admin_only
+async def cleanup_cmd(client, message):
+    if len(message.command) < 2 or not message.command[1].isdigit():
+        return await say(message, "Usage: /cleanup &lt;seconds&gt; (0 = off, default 300)\nGroup ke saare messages itne seconds baad delete honge.")
+    setcfg(message.chat.id, "cleanup", int(message.command[1]))
+    await say(message, f"🧹 Cleanup: {message.command[1]}s")
+
+
+@app.on_message(filters.command("hide") & filters.group)
+@admin_only
+async def hide_cmd(client, message):
+    v = onoff_arg(message)
+    if v is None:
+        return await say(message, "Usage: /hide on|off\nON: admin/owner ke ilawa kisi ka message group me nahi dikhega.")
+    setcfg(message.chat.id, "hide", v)
+    await say(message, f"🙈 Hide mode: {'ON' if v == '1' else 'OFF'}")
 
 
 # --------------------------------------------------------------------------- #
