@@ -81,7 +81,8 @@ DEFAULTS = {
     "autodelete": "0",  # seconds, 0 = off
     "cleanup": "300",  # group ka har message itne seconds baad delete (0 = off)
     "admin_secs": "30",  # admin msgs + bot command-replies itne sec baad delete (0 = cleanup wala time)
-    "hide": "1",  # 1 = non-admin members ke messages turant delete (sirf admin/owner ke msgs + bot ka welcome dikhe)
+    "member_secs": "60",  # non-admin members ke messages itne sec baad delete (0 = turant)
+    "hide": "1",  # 1 = non-admin members ke messages member_secs baad delete (admin/owner ke msgs admin_secs baad)
     "clean_service": "0",
     "warn_limit": "3",
     "warn_action": "mute",  # mute | kick | ban
@@ -144,7 +145,7 @@ ADMIN = (enums.ChatMemberStatus.OWNER, enums.ChatMemberStatus.ADMINISTRATOR)
 RESERVED = {
     "start", "help", "ban", "unban", "kick", "mute", "unmute", "warn", "unwarn",
     "warns", "purge", "id", "info", "settings", "stats", "rules", "setrules",
-    "setwelcome", "setgoodbye", "verify", "forcesub", "autodelete", "cleanup", "hide", "adminclean", "warnlimit",
+    "setwelcome", "setgoodbye", "verify", "forcesub", "autodelete", "cleanup", "hide", "adminclean", "memberclean", "warnlimit",
     "warnaction", "addcmd", "delcmd", "cmds",
     "approve", "unapprove", "approved", "lock", "unlock", "locks", "antilink",
     "antibot", "setflood", "antiraid", "addblacklist", "rmblacklist", "blacklist",
@@ -770,8 +771,8 @@ async def custom_cmd_handler(client, message):
 
 # --------------------------------------------------------------------------- #
 # Privacy + auto cleanup
-#   * Admin/owner ke ilawa kisi member ka message group me nahi rukta
-#     (turant delete; commands 3 sec baad taaki bot reply kar sake).
+#   * Admin/owner ke ilawa kisi member ka message member_secs (default 60s) baad delete
+#     (commands 3 sec baad taaki bot reply kar sake).
 #     Agar /setlog channel set hai to delete se pehle message wahan copy ho jata hai.
 #   * Baaki sab (admin msgs, bot ka welcome/replies) CLEANUP seconds (default 5 min) baad delete.
 # --------------------------------------------------------------------------- #
@@ -802,8 +803,11 @@ async def privacy_cleaner(client, message):
                 await message.copy(int(ch))
             except Exception:
                 pass
+        msecs = int(cfg(cid, "member_secs"))  # default 60s
         if (message.text or message.caption or "").startswith("/"):
             autodel(cid, message, 3)
+        elif msecs > 0:
+            autodel(cid, message, msecs)
         else:
             try:
                 await message.delete()
@@ -827,6 +831,15 @@ async def adminclean_cmd(client, message):
         return await say(message, "Usage: /adminclean &lt;seconds&gt; (default 30)\nAdmin ke messages aur bot ke command-replies itne sec baad delete.")
     setcfg(message.chat.id, "admin_secs", int(message.command[1]))
     await say(message, f"🕶 Admin privacy: {message.command[1]}s")
+
+
+@app.on_message(filters.command("memberclean") & filters.group)
+@admin_only
+async def memberclean_cmd(client, message):
+    if len(message.command) < 2 or not message.command[1].isdigit():
+        return await say(message, "Usage: /memberclean &lt;seconds&gt; (0 = turant, default 60)\nNon-admin members ke messages itne sec baad delete honge.")
+    setcfg(message.chat.id, "member_secs", int(message.command[1]))
+    await say(message, f"👥 Member messages: {message.command[1]}s baad delete")
 
 
 @app.on_message(filters.command("cleanup") & filters.group)

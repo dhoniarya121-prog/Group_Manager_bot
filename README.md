@@ -232,4 +232,5 @@ Bot ko 24x7 chalane ke liye VPS ya hosting par `python group_manager_bot.py` cha
 - `/setlog` channel set ho to delete hone se pehle members ke messages wahan copy ho jaate hain, taaki admins padh sakein.
 - `/cleanup <seconds>` (0 = off) · `/hide on|off`
 - Bot ko **Delete messages** admin right zaroori hai.
+- **Member messages:** non-admin members ke messages `/memberclean <seconds>` (default 60s) baad delete hote hain (commands 3s me).
 - **Admin privacy:** admin/owner ke messages bhi `/adminclean <seconds>` (default 30s) baad delete hote hain; admin `/commands` 2s me, aur bot ke command-replies bhi usi time par. Sirf welcome message 5 min tak rehta hai.
